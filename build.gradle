@@ -1,0 +1,241 @@
+import java.awt.Graphics2D
+import java.awt.RenderingHints
+import java.awt.image.BufferedImage
+import java.io.ByteArrayOutputStream
+import java.util.Locale
+import javax.imageio.ImageIO
+
+plugins {
+    id 'application'
+    id 'org.openjfx.javafxplugin' version '0.1.0'
+}
+
+group = 'com.localdrop'
+version = '0.1.0'
+
+repositories {
+    mavenCentral()
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+javafx {
+    version = '21'
+    modules = ['javafx.controls']
+}
+
+dependencies {
+    implementation project(':localdrop-protocol')
+    implementation 'com.fasterxml.jackson.core:jackson-databind:2.18.4'
+    implementation 'com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.18.4'
+
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.12.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+application {
+    mainClass = 'com.localdrop.LocalDropLauncher'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+jar {
+    manifest {
+        attributes 'Main-Class': application.mainClass.get()
+    }
+}
+
+def isWindows = System.getProperty('os.name').toLowerCase(Locale.ROOT).contains('windows')
+def installerAppName = 'LocalDrop'
+def installerVersion = project.version.toString()
+def installerDescription = 'Local network file transfer'
+def winUpgradeUuid = '6af7e2f8-87f9-4f90-9f34-4553c379785c'
+def wixDownloadUrl = 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip'
+def wixZipFile = layout.buildDirectory.file('tools/wix314-binaries.zip')
+def wixHomeDir = layout.buildDirectory.dir('tools/wix')
+def jpackageInputDir = layout.buildDirectory.dir('jpackage/input')
+def jpackageRootDir = layout.buildDirectory.dir('jpackage')
+def appImageDir = layout.buildDirectory.dir("jpackage/${installerAppName}")
+def installerDir = layout.buildDirectory.dir('installer')
+def generatedWindowsIcon = layout.buildDirectory.file('jpackage/localdrop.ico')
+
+def resolveJpackageExecutable = {
+    def javaHome = System.getenv('JAVA_HOME') ?: System.getProperty('java.home')
+    def executableName = isWindows ? 'jpackage.exe' : 'jpackage'
+    def executable = new File(javaHome, "bin/${executableName}")
+    if (!executable.exists()) {
+        throw new GradleException("jpackage was not found under ${javaHome}. Use a JDK 21+ installation that includes jpackage.")
+    }
+    executable.absolutePath
+}
+
+tasks.register('generateWindowsInstallerIcon') {
+    description = 'Generates a Windows ICO file for jpackage from the app PNG icon.'
+    group = 'distribution'
+    inputs.file('src/main/resources/com/localdrop/icons/app.png')
+    outputs.file(generatedWindowsIcon)
+
+    doLast {
+        File sourceFile = file('src/main/resources/com/localdrop/icons/app.png')
+        BufferedImage sourceImage = ImageIO.read(sourceFile)
+        if (sourceImage == null) {
+            throw new GradleException("Unable to read icon source ${sourceFile}")
+        }
+
+        BufferedImage scaled = new BufferedImage(256, 256, BufferedImage.TYPE_INT_ARGB)
+        Graphics2D graphics = scaled.createGraphics()
+        graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC)
+        graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY)
+        graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+        graphics.drawImage(sourceImage, 0, 0, 256, 256, null)
+        graphics.dispose()
+
+        ByteArrayOutputStream pngBuffer = new ByteArrayOutputStream()
+        ImageIO.write(scaled, 'png', pngBuffer)
+        byte[] pngBytes = pngBuffer.toByteArray()
+
+        File iconFile = generatedWindowsIcon.get().asFile
+        iconFile.parentFile.mkdirs()
+
+        iconFile.withOutputStream { output ->
+            def writeWord = { int value ->
+                output.write(value & 0xFF)
+                output.write((value >> 8) & 0xFF)
+            }
+            def writeDword = { int value ->
+                output.write(value & 0xFF)
+                output.write((value >> 8) & 0xFF)
+                output.write((value >> 16) & 0xFF)
+                output.write((value >> 24) & 0xFF)
+            }
+
+            writeWord(0)
+            writeWord(1)
+            writeWord(1)
+
+            output.write(0)
+            output.write(0)
+            output.write(0)
+            output.write(0)
+            writeWord(1)
+            writeWord(32)
+            writeDword(pngBytes.length)
+            writeDword(22)
+            output.write(pngBytes)
+        }
+    }
+}
+
+tasks.register('downloadWix') {
+    description = 'Downloads portable WiX Toolset binaries locally for jpackage Windows installer builds.'
+    group = 'distribution'
+    outputs.dir(wixHomeDir)
+
+    doLast {
+        File wixDir = wixHomeDir.get().asFile
+        File candleExe = new File(wixDir, 'candle.exe')
+        if (candleExe.exists()) {
+            return
+        }
+
+        wixDir.mkdirs()
+        File archive = wixZipFile.get().asFile
+        archive.parentFile.mkdirs()
+
+        if (!archive.exists()) {
+            logger.lifecycle("Downloading WiX Toolset from ${wixDownloadUrl}")
+            new URL(wixDownloadUrl).withInputStream { input ->
+                archive.withOutputStream { output -> output << input }
+            }
+        }
+
+        copy {
+            from zipTree(archive)
+            into wixDir
+        }
+    }
+}
+
+tasks.register('prepareJpackageInput', Copy) {
+    description = 'Collects application JARs for jpackage.'
+    group = 'distribution'
+    dependsOn tasks.installDist
+    from(layout.buildDirectory.dir("install/${project.name}/lib"))
+    into(jpackageInputDir)
+}
+
+tasks.register('packageAppImage', Exec) {
+    description = 'Builds a self-contained LocalDrop app image with jpackage.'
+    group = 'distribution'
+    dependsOn 'prepareJpackageInput', 'generateWindowsInstallerIcon'
+    inputs.dir(jpackageInputDir)
+    inputs.file(generatedWindowsIcon)
+    outputs.dir(appImageDir)
+
+    onlyIf { isWindows }
+
+    doFirst {
+        delete(appImageDir)
+        jpackageRootDir.get().asFile.mkdirs()
+    }
+
+    commandLine(
+        resolveJpackageExecutable(),
+        '--type', 'app-image',
+        '--dest', jpackageRootDir.get().asFile.absolutePath,
+        '--name', installerAppName,
+        '--app-version', installerVersion,
+        '--vendor', installerAppName,
+        '--description', installerDescription,
+        '--input', jpackageInputDir.get().asFile.absolutePath,
+        '--main-jar', "${project.name}-${project.version}.jar",
+        '--main-class', application.mainClass.get(),
+        '--icon', generatedWindowsIcon.get().asFile.absolutePath
+    )
+}
+
+tasks.register('packageInstaller', Exec) {
+    description = 'Builds a Windows EXE installer for LocalDrop with folder selection and shortcut prompt.'
+    group = 'distribution'
+    dependsOn 'packageAppImage', 'downloadWix'
+    inputs.dir(appImageDir)
+    inputs.file(generatedWindowsIcon)
+    outputs.dir(installerDir)
+
+    onlyIf { isWindows }
+
+    doFirst {
+        delete(installerDir)
+        installerDir.get().asFile.mkdirs()
+    }
+
+    environment 'PATH', wixHomeDir.get().asFile.absolutePath + File.pathSeparator + System.getenv('PATH')
+    commandLine(
+        resolveJpackageExecutable(),
+        '--type', 'exe',
+        '--dest', installerDir.get().asFile.absolutePath,
+        '--name', installerAppName,
+        '--app-version', installerVersion,
+        '--vendor', installerAppName,
+        '--description', installerDescription,
+        '--install-dir', installerAppName,
+        '--app-image', appImageDir.get().asFile.absolutePath,
+        '--icon', generatedWindowsIcon.get().asFile.absolutePath,
+        '--win-dir-chooser',
+        '--win-shortcut',
+        '--win-shortcut-prompt',
+        '--win-menu',
+        '--win-menu-group', installerAppName,
+        '--win-upgrade-uuid', winUpgradeUuid
+    )
+}
