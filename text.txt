@@ -1,1 +1,0 @@
-For any Android integration work, `ANDROID_INTEGRATION.md` in the project root must be reviewed first. Follow it together with `localdrop-protocol` as the authoritative integration contract.
