@@ -103,6 +103,9 @@ public class ConfigService {
         if (config.getLanguage() == null || config.getLanguage().isBlank()) {
             config.setLanguage(AppLanguage.detectDefault().getCode());
         }
+        if (config.getLogLevel() == null || config.getLogLevel().isBlank()) {
+            config.setLogLevel("INFO");
+        }
         if (config.getWindowWidth() < 1200) {
             config.setWindowWidth(1400);
         }

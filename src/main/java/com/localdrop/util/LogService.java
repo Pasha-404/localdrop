@@ -9,6 +9,7 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Comparator;
+import java.util.Locale;
 import java.util.logging.ConsoleHandler;
 import java.util.logging.FileHandler;
 import java.util.logging.Formatter;
@@ -22,22 +23,30 @@ public final class LogService {
     private static final Logger ROOT_LOGGER = Logger.getLogger("com.localdrop");
     private static final DateTimeFormatter FILE_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
     private static final Duration RETENTION = Duration.ofHours(24);
+    private static final Level DEFAULT_LEVEL = Level.INFO;
     private static volatile boolean initialized;
+    private static volatile Level currentLevel = DEFAULT_LEVEL;
 
     private LogService() {
     }
 
     public static synchronized void initialize() throws IOException {
-        if (initialized) {
-            return;
-        }
+        initialize(DEFAULT_LEVEL);
+    }
 
+    public static synchronized void initialize(String configuredLevel) throws IOException {
+        initialize(resolveLevel(configuredLevel));
+    }
+
+    public static synchronized void initialize(Level level) throws IOException {
         Path logsDirectory = AppPaths.logsDirectory();
         Files.createDirectories(logsDirectory);
-        cleanupOldLogs(logsDirectory);
+        if (!initialized) {
+            cleanupOldLogs(logsDirectory);
+        }
 
         ROOT_LOGGER.setUseParentHandlers(false);
-        ROOT_LOGGER.setLevel(Level.INFO);
+        ROOT_LOGGER.setLevel(level);
         for (Handler handler : ROOT_LOGGER.getHandlers()) {
             ROOT_LOGGER.removeHandler(handler);
         }
@@ -60,17 +69,18 @@ public final class LogService {
         };
 
         ConsoleHandler consoleHandler = new ConsoleHandler();
-        consoleHandler.setLevel(Level.INFO);
+        consoleHandler.setLevel(level);
         consoleHandler.setFormatter(formatter);
         ROOT_LOGGER.addHandler(consoleHandler);
 
         String logFileName = "localdrop-" + FILE_FORMAT.format(LocalDateTime.now()) + ".log";
         FileHandler fileHandler = new FileHandler(logsDirectory.resolve(logFileName).toString(), true);
-        fileHandler.setLevel(Level.ALL);
+        fileHandler.setLevel(level);
         fileHandler.setFormatter(formatter);
         ROOT_LOGGER.addHandler(fileHandler);
 
         initialized = true;
+        currentLevel = level;
         ROOT_LOGGER.info("Logging initialized");
     }
 
@@ -85,6 +95,11 @@ public final class LogService {
             ROOT_LOGGER.removeHandler(handler);
         }
         initialized = false;
+        currentLevel = DEFAULT_LEVEL;
+    }
+
+    public static Level currentLevel() {
+        return currentLevel;
     }
 
     private static void cleanupOldLogs(Path logsDirectory) throws IOException {
@@ -115,5 +130,16 @@ public final class LogService {
             builder.append("    at ").append(element).append(System.lineSeparator());
         }
         return builder.toString().trim();
+    }
+
+    private static Level resolveLevel(String configuredLevel) {
+        if (configuredLevel == null || configuredLevel.isBlank()) {
+            return DEFAULT_LEVEL;
+        }
+        try {
+            return Level.parse(configuredLevel.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException ignored) {
+            return DEFAULT_LEVEL;
+        }
     }
 }

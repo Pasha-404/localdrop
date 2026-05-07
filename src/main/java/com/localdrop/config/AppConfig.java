@@ -4,6 +4,7 @@ public class AppConfig {
     private String deviceId;
     private String receiveFolder;
     private String language;
+    private String logLevel;
     private double windowWidth = 1400;
     private double windowHeight = 800;
 
@@ -29,6 +30,14 @@ public class AppConfig {
 
     public void setLanguage(String language) {
         this.language = language;
+    }
+
+    public String getLogLevel() {
+        return logLevel;
+    }
+
+    public void setLogLevel(String logLevel) {
+        this.logLevel = logLevel;
     }
 
     public double getWindowWidth() {

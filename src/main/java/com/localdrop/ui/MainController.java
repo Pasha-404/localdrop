@@ -28,7 +28,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -400,6 +402,10 @@ public class MainController {
     }
 
     private void applyDeviceSnapshot(List<DeviceInfo> snapshot) {
+        if (isSameDeviceSnapshot(snapshot)) {
+            return;
+        }
+
         DeviceInfo selectedDevice = view.getDeviceListView().getSelectionModel().getSelectedItem();
         String selectedDeviceId = selectedDevice == null ? null : selectedDevice.getDeviceId();
 
@@ -414,6 +420,33 @@ public class MainController {
         }
         view.refreshDevices();
         updateSendButtonState();
+    }
+
+    private boolean isSameDeviceSnapshot(List<DeviceInfo> snapshot) {
+        if (devices.size() != snapshot.size()) {
+            return false;
+        }
+
+        List<DeviceInfo> currentSnapshot = devices.stream()
+            .sorted(Comparator.comparing(DeviceInfo::getDeviceId))
+            .toList();
+        List<DeviceInfo> nextSnapshot = snapshot.stream()
+            .sorted(Comparator.comparing(DeviceInfo::getDeviceId))
+            .toList();
+
+        for (int index = 0; index < currentSnapshot.size(); index++) {
+            DeviceInfo current = currentSnapshot.get(index);
+            DeviceInfo next = nextSnapshot.get(index);
+            if (!Objects.equals(current.getDeviceId(), next.getDeviceId())
+                || !Objects.equals(current.getDeviceName(), next.getDeviceName())
+                || !Objects.equals(current.getDeviceType(), next.getDeviceType())
+                || !Objects.equals(current.getStatus(), next.getStatus())
+                || !Objects.equals(current.getHostAddress(), next.getHostAddress())
+                || current.getTcpPort() != next.getTcpPort()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void changeLanguage(AppLanguage language) {

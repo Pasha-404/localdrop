@@ -20,6 +20,7 @@ import java.util.Comparator;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -134,6 +135,8 @@ public class DiscoveryService {
         if (previous == null || hasPresentationChanged(previous, device)) {
             logger.info("Discovered device " + device.getDeviceName() + " at " + device.getHostAddress() + ":" + device.getTcpPort());
             emitDevices();
+        } else if (logger.isLoggable(java.util.logging.Level.FINE)) {
+            logger.fine("Refreshed device heartbeat for " + device.getDeviceName() + " at " + device.getHostAddress() + ":" + device.getTcpPort());
         }
     }
 
@@ -184,8 +187,14 @@ public class DiscoveryService {
 
     private void pruneExpiredDevices() {
         long cutoff = System.currentTimeMillis() - ProtocolConstants.DISCOVERY_DEVICE_TIMEOUT_MILLIS;
+        List<DeviceInfo> removedDevices = devices.values().stream()
+            .filter(device -> device.getLastSeenAt() < cutoff)
+            .toList();
         boolean removed = devices.entrySet().removeIf(entry -> entry.getValue().getLastSeenAt() < cutoff);
         if (removed) {
+            for (DeviceInfo device : removedDevices) {
+                logger.info("Device disappeared " + device.getDeviceName() + " at " + device.getHostAddress() + ":" + device.getTcpPort());
+            }
             emitDevices();
         }
     }
@@ -198,10 +207,10 @@ public class DiscoveryService {
     }
 
     private boolean hasPresentationChanged(DeviceInfo previous, DeviceInfo current) {
-        return !previous.getDeviceName().equals(current.getDeviceName())
-            || !previous.getDeviceType().equals(current.getDeviceType())
-            || !previous.getStatus().equals(current.getStatus())
-            || !previous.getHostAddress().equals(current.getHostAddress())
+        return !Objects.equals(previous.getDeviceName(), current.getDeviceName())
+            || !Objects.equals(previous.getDeviceType(), current.getDeviceType())
+            || !Objects.equals(previous.getStatus(), current.getStatus())
+            || !Objects.equals(previous.getHostAddress(), current.getHostAddress())
             || previous.getTcpPort() != current.getTcpPort();
     }
 }

@@ -29,6 +29,7 @@ public class LocalDropApp extends Application {
 
             ConfigService configService = new ConfigService();
             AppConfig config = configService.load();
+            LogService.initialize(config.getLogLevel());
 
             controller = new MainController(configService, config, ConfigService.resolveDeviceName());
             controller.attachStage(primaryStage);

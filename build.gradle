@@ -11,7 +11,7 @@ plugins {
 }
 
 group = 'com.localdrop'
-version = '0.1.0'
+version = '1.0'
 
 repositories {
     mavenCentral()
@@ -68,6 +68,7 @@ def jpackageRootDir = layout.buildDirectory.dir('jpackage')
 def appImageDir = layout.buildDirectory.dir("jpackage/${installerAppName}")
 def installerDir = layout.buildDirectory.dir('installer')
 def generatedWindowsIcon = layout.buildDirectory.file('jpackage/localdrop.ico')
+def externalRootIcoIcon = file('localdrop-icon.ico')
 
 def resolveJpackageExecutable = {
     def javaHome = System.getenv('JAVA_HOME') ?: System.getProperty('java.home')
@@ -82,10 +83,22 @@ def resolveJpackageExecutable = {
 tasks.register('generateWindowsInstallerIcon') {
     description = 'Generates a Windows ICO file for jpackage from the app PNG icon.'
     group = 'distribution'
-    inputs.file('src/main/resources/com/localdrop/icons/app.png')
+    inputs.files('src/main/resources/com/localdrop/icons/app.png', 'localdrop-icon.ico')
     outputs.file(generatedWindowsIcon)
 
     doLast {
+        File iconFile = generatedWindowsIcon.get().asFile
+        iconFile.parentFile.mkdirs()
+
+        if (externalRootIcoIcon.exists()) {
+            copy {
+                from externalRootIcoIcon
+                into iconFile.parentFile
+                rename { 'localdrop.ico' }
+            }
+            return
+        }
+
         File sourceFile = file('src/main/resources/com/localdrop/icons/app.png')
         BufferedImage sourceImage = ImageIO.read(sourceFile)
         if (sourceImage == null) {
@@ -103,9 +116,6 @@ tasks.register('generateWindowsInstallerIcon') {
         ByteArrayOutputStream pngBuffer = new ByteArrayOutputStream()
         ImageIO.write(scaled, 'png', pngBuffer)
         byte[] pngBytes = pngBuffer.toByteArray()
-
-        File iconFile = generatedWindowsIcon.get().asFile
-        iconFile.parentFile.mkdirs()
 
         iconFile.withOutputStream { output ->
             def writeWord = { int value ->

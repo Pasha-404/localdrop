@@ -64,7 +64,7 @@ gradlew.bat packageInstaller
 
 Installer output:
 
-- `build\installer\LocalDrop-0.1.0.exe`
+- `build\installer\LocalDrop-1.0.exe`
 
 Notes:
 
