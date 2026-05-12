@@ -2,15 +2,21 @@ package com.localdrop.protocol.discovery;
 
 import com.localdrop.protocol.ProtocolConstants;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+
 public class DiscoveryMessage {
     private String type;
-    private int protocolVersion;
+    private Integer protocolVersion;
+    private String messageId;
     private String deviceId;
     private String deviceName;
     private String deviceType;
     private String status;
-    private int tcpPort;
-    private long timestamp;
+    private Integer tcpPort;
+    private List<String> capabilities;
+    private Long timestamp;
 
     public DiscoveryMessage() {
     }
@@ -24,6 +30,8 @@ public class DiscoveryMessage {
         message.setDeviceType(deviceType);
         message.setStatus(ProtocolConstants.STATUS_READY);
         message.setTcpPort(tcpPort);
+        message.setCapabilities(ProtocolConstants.CAPABILITIES);
+        message.setMessageId(UUID.randomUUID().toString());
         message.setTimestamp(System.currentTimeMillis());
         return message;
     }
@@ -36,12 +44,20 @@ public class DiscoveryMessage {
         this.type = type;
     }
 
-    public int getProtocolVersion() {
+    public Integer getProtocolVersion() {
         return protocolVersion;
     }
 
-    public void setProtocolVersion(int protocolVersion) {
+    public void setProtocolVersion(Integer protocolVersion) {
         this.protocolVersion = protocolVersion;
+    }
+
+    public String getMessageId() {
+        return messageId;
+    }
+
+    public void setMessageId(String messageId) {
+        this.messageId = messageId;
     }
 
     public String getDeviceId() {
@@ -76,19 +92,28 @@ public class DiscoveryMessage {
         this.status = status;
     }
 
-    public int getTcpPort() {
+    public Integer getTcpPort() {
         return tcpPort;
     }
 
-    public void setTcpPort(int tcpPort) {
+    public void setTcpPort(Integer tcpPort) {
         this.tcpPort = tcpPort;
     }
 
-    public long getTimestamp() {
+    public List<String> getCapabilities() {
+        return capabilities;
+    }
+
+    public void setCapabilities(List<String> capabilities) {
+        this.capabilities = capabilities == null ? null : new ArrayList<>(capabilities);
+    }
+
+    public Long getTimestamp() {
         return timestamp;
     }
 
-    public void setTimestamp(long timestamp) {
+    public void setTimestamp(Long timestamp) {
         this.timestamp = timestamp;
     }
+
 }

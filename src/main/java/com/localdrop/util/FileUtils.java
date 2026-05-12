@@ -1,5 +1,7 @@
 package com.localdrop.util;
 
+import com.localdrop.protocol.ProtocolConstants;
+
 import java.awt.Desktop;
 import java.io.IOException;
 import java.net.NetworkInterface;
@@ -13,11 +15,19 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Enumeration;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
 
 public final class FileUtils {
+    private static final Set<String> WINDOWS_RESERVED_NAMES = Set.of(
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+    );
+
     private FileUtils() {
     }
 
@@ -72,6 +82,40 @@ public final class FileUtils {
         Path normalized = Paths.get(normalizedSeparators).normalize();
         if (normalized.isAbsolute() || normalized.startsWith("..")) {
             return Paths.get(fallbackFileName).normalize();
+        }
+        return normalized;
+    }
+
+    public static Path sanitizeReceivedRelativePath(String relativePath, String fileName) throws IOException {
+        validateFileName(fileName);
+        String candidate = relativePath == null || relativePath.isBlank() ? fileName : relativePath.trim();
+        if (candidate.length() > ProtocolConstants.MAX_RELATIVE_PATH_LENGTH) {
+            throw new IOException("Relative path is too long.");
+        }
+        if (candidate.indexOf('\0') >= 0 || candidate.startsWith("/") || candidate.startsWith("\\")) {
+            throw new IOException("Relative path is not safe.");
+        }
+        if (candidate.matches("^[A-Za-z]:.*") || candidate.startsWith("//") || candidate.startsWith("\\\\")) {
+            throw new IOException("Absolute paths are not allowed.");
+        }
+
+        String normalizedSeparators = candidate.replace('\\', '/');
+        Path normalized = Paths.get(normalizedSeparators).normalize();
+        if (normalized.isAbsolute() || normalized.getNameCount() == 0 || normalized.startsWith("..")) {
+            throw new IOException("Relative path is not safe.");
+        }
+        if (normalized.getNameCount() > ProtocolConstants.MAX_RELATIVE_PATH_DEPTH) {
+            throw new IOException("Relative path is too deep.");
+        }
+
+        Set<String> seenSegments = new HashSet<>();
+        for (Path segmentPath : normalized) {
+            String segment = segmentPath.toString();
+            validatePathSegment(segment);
+            seenSegments.add(segment);
+        }
+        if (seenSegments.isEmpty()) {
+            throw new IOException("Relative path is empty.");
         }
         return normalized;
     }
@@ -147,6 +191,42 @@ public final class FileUtils {
             Files.size(absolutePath),
             Files.getLastModifiedTime(absolutePath).toMillis()
         );
+    }
+
+    private static void validateFileName(String fileName) throws IOException {
+        if (fileName == null || fileName.isBlank()) {
+            throw new IOException("File name is empty.");
+        }
+        if (fileName.length() > ProtocolConstants.MAX_FILE_NAME_LENGTH) {
+            throw new IOException("File name is too long.");
+        }
+        if (fileName.contains("/") || fileName.contains("\\") || fileName.indexOf('\0') >= 0) {
+            throw new IOException("File name contains invalid characters.");
+        }
+        validatePathSegment(fileName);
+    }
+
+    private static void validatePathSegment(String segment) throws IOException {
+        if (segment == null || segment.isBlank() || ".".equals(segment) || "..".equals(segment)) {
+            throw new IOException("Path contains an empty or unsafe segment.");
+        }
+        if (segment.endsWith(" ") || segment.endsWith(".")) {
+            throw new IOException("Windows path segment cannot end with a space or dot.");
+        }
+        for (int index = 0; index < segment.length(); index++) {
+            char ch = segment.charAt(index);
+            if (Character.isISOControl(ch) || "<>:\"|?*".indexOf(ch) >= 0) {
+                throw new IOException("Path segment contains invalid characters.");
+            }
+        }
+        String stem = segment;
+        int extensionIndex = stem.indexOf('.');
+        if (extensionIndex >= 0) {
+            stem = stem.substring(0, extensionIndex);
+        }
+        if (WINDOWS_RESERVED_NAMES.contains(stem.toUpperCase(Locale.ROOT))) {
+            throw new IOException("Path segment uses a reserved Windows name.");
+        }
     }
 
     public record TransferSource(Path absolutePath, String relativePath, long size, long lastModified) {

@@ -1,6 +1,6 @@
 # LocalDrop
 
-LocalDrop is a JavaFX-based Windows desktop MVP for local network file transfer without cloud services or accounts.
+LocalDrop is a JavaFX-based Windows desktop app for local network file transfer without cloud services or accounts.
 
 ## Project Structure
 
@@ -64,7 +64,7 @@ gradlew.bat packageInstaller
 
 Installer output:
 
-- `build\installer\LocalDrop-1.0.exe`
+- `build\installer\LocalDrop-2.0.0.exe`
 
 Notes:
 
@@ -74,14 +74,16 @@ Notes:
 
 ## Notes
 
-- The app uses UDP broadcast for discovery and TCP for file transfer inside the local network.
+- LocalDrop uses protocol v2-open only. Any visible LocalDrop device on the same LAN can receive files.
+- The app uses UDP broadcast/unicast for discovery and TCP for file transfer inside the local network.
 - Windows may show a firewall prompt on first launch. Allow LocalDrop on private networks so discovery and file transfer can work.
 - The application minimizes to the system tray instead of exiting when the main window is closed.
 
-## MVP Limitations
+## Limitations
 
-- Windows desktop app only. No Android client is included yet.
-- No encryption, authentication, user accounts, or internet relay.
+- Windows desktop app only. Android code lives in a separate project.
+- Protocol v2 is not wire-compatible with the old unsigned v1 flow.
+- File payload bytes and control messages are not encrypted or authenticated yet; use LocalDrop only on trusted local networks.
 - The transfer queue is stored in memory only and is lost after full exit.
 - Transfer resume from byte offsets is not implemented.
 - Recently received items are stored for the current session only.

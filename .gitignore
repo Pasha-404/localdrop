@@ -1,6 +1,8 @@
 .gradle/
 build/
 out/
+.dev/
+.serena/
 
 .idea/
 *.iml

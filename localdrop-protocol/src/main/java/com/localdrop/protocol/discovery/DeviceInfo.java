@@ -2,6 +2,9 @@ package com.localdrop.protocol.discovery;
 
 import com.localdrop.protocol.ProtocolConstants;
 
+import java.util.ArrayList;
+import java.util.List;
+
 public class DeviceInfo {
     private final String deviceId;
     private final String deviceName;
@@ -9,6 +12,7 @@ public class DeviceInfo {
     private final String status;
     private final String hostAddress;
     private final int tcpPort;
+    private final List<String> capabilities;
     private volatile long lastSeenAt;
 
     public DeviceInfo(
@@ -18,6 +22,7 @@ public class DeviceInfo {
         String status,
         String hostAddress,
         int tcpPort,
+        List<String> capabilities,
         long lastSeenAt
     ) {
         this.deviceId = deviceId;
@@ -26,6 +31,7 @@ public class DeviceInfo {
         this.status = status;
         this.hostAddress = hostAddress;
         this.tcpPort = tcpPort;
+        this.capabilities = capabilities == null ? List.of() : List.copyOf(capabilities);
         this.lastSeenAt = lastSeenAt;
     }
 
@@ -51,6 +57,10 @@ public class DeviceInfo {
 
     public int getTcpPort() {
         return tcpPort;
+    }
+
+    public List<String> getCapabilities() {
+        return new ArrayList<>(capabilities);
     }
 
     public long getLastSeenAt() {

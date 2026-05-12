@@ -2,72 +2,96 @@ package com.localdrop.protocol.transfer;
 
 import com.localdrop.protocol.ProtocolConstants;
 import com.localdrop.protocol.ProtocolJson;
-import com.fasterxml.jackson.annotation.JsonAlias;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
 
 public class ProtocolMessage {
     private String type;
     private Integer protocolVersion;
+    private String messageId;
     private String sessionId;
-    @JsonAlias("deviceId")
-    private String senderDeviceId;
-    @JsonAlias("deviceName")
-    private String senderDeviceName;
-    @JsonAlias("totalFiles")
-    private Integer fileCount;
     private String fileId;
+    private String deviceId;
+    private String deviceName;
+    private String deviceType;
+    private String status;
+    private Integer tcpPort;
+    private List<String> capabilities;
+    private Long timestamp;
     private String relativePath;
     private String fileName;
     private Long size;
+    private Long totalSize;
+    private String sha256;
     private Long lastModified;
-    private String status;
-    @JsonAlias("reason")
-    private String message;
+    private Integer totalFiles;
+    private String reason;
+    private String errorCode;
+    private Boolean checksumOk;
     private String savedAs;
 
-    public static ProtocolMessage sessionStart(String sessionId, String senderDeviceId, String senderDeviceName, int fileCount) {
-        ProtocolMessage message = new ProtocolMessage();
-        message.setType(ProtocolConstants.TYPE_SESSION_START);
-        message.setProtocolVersion(ProtocolConstants.PROTOCOL_VERSION);
+    public static ProtocolMessage sessionStart(
+        String sessionId,
+        String senderDeviceId,
+        String senderDeviceName,
+        String senderDeviceType,
+        int totalFiles,
+        long totalSize,
+        List<String> capabilities
+    ) {
+        ProtocolMessage message = base(ProtocolConstants.TYPE_SESSION_START);
         message.setSessionId(sessionId);
-        message.setSenderDeviceId(senderDeviceId);
-        message.setSenderDeviceName(senderDeviceName);
-        message.setFileCount(fileCount);
+        message.setDeviceId(senderDeviceId);
+        message.setDeviceName(senderDeviceName);
+        message.setDeviceType(senderDeviceType);
+        message.setTotalFiles(totalFiles);
+        message.setTotalSize(totalSize);
+        message.setCapabilities(capabilities);
         return message;
     }
 
-    public static ProtocolMessage sessionAccepted(String sessionId) {
-        ProtocolMessage message = new ProtocolMessage();
-        message.setType(ProtocolConstants.TYPE_SESSION_ACCEPTED);
+    public static ProtocolMessage sessionAccepted(
+        String sessionId,
+        String localDeviceId,
+        String localDeviceName,
+        String localDeviceType
+    ) {
+        ProtocolMessage message = base(ProtocolConstants.TYPE_SESSION_ACCEPTED);
         message.setSessionId(sessionId);
+        message.setDeviceId(localDeviceId);
+        message.setDeviceName(localDeviceName);
+        message.setDeviceType(localDeviceType);
         return message;
     }
 
-    public static ProtocolMessage sessionRejected(String sessionId, String reason) {
-        ProtocolMessage message = new ProtocolMessage();
-        message.setType(ProtocolConstants.TYPE_SESSION_REJECTED);
+    public static ProtocolMessage sessionRejected(String sessionId, String reason, String errorCode) {
+        ProtocolMessage message = base(ProtocolConstants.TYPE_SESSION_REJECTED);
         message.setSessionId(sessionId);
-        message.setMessage(reason);
+        message.setReason(reason);
+        message.setErrorCode(errorCode);
         return message;
     }
 
     public static ProtocolMessage fileMeta(
         String sessionId,
         String fileId,
+        String senderDeviceId,
         String relativePath,
         String fileName,
         long size,
         long lastModified
     ) {
-        ProtocolMessage message = new ProtocolMessage();
-        message.setType(ProtocolConstants.TYPE_FILE_META);
+        ProtocolMessage message = base(ProtocolConstants.TYPE_FILE_META);
         message.setSessionId(sessionId);
         message.setFileId(fileId);
+        message.setDeviceId(senderDeviceId);
         message.setRelativePath(relativePath);
         message.setFileName(fileName);
         message.setSize(size);
@@ -75,31 +99,49 @@ public class ProtocolMessage {
         return message;
     }
 
-    public static ProtocolMessage fileAck(String sessionId, String fileId, boolean ok, String payloadMessage) {
-        ProtocolMessage message = new ProtocolMessage();
-        message.setType(ProtocolConstants.TYPE_FILE_ACK);
+    public static ProtocolMessage fileAck(
+        String sessionId,
+        String fileId,
+        String localDeviceId,
+        String localDeviceName,
+        String localDeviceType,
+        boolean ok,
+        String reason,
+        String errorCode
+    ) {
+        ProtocolMessage message = base(ProtocolConstants.TYPE_FILE_ACK);
         message.setSessionId(sessionId);
         message.setFileId(fileId);
+        message.setDeviceId(localDeviceId);
+        message.setDeviceName(localDeviceName);
+        message.setDeviceType(localDeviceType);
         message.setStatus(ok ? ProtocolConstants.STATUS_OK : ProtocolConstants.STATUS_ERROR);
-        if (ok) {
-            message.setSavedAs(payloadMessage);
-        } else {
-            message.setMessage(payloadMessage);
+        message.setChecksumOk(ok);
+        if (!ok) {
+            message.setReason(reason);
+            message.setErrorCode(errorCode);
         }
         return message;
     }
 
-    public static ProtocolMessage sessionEnd(String sessionId) {
-        ProtocolMessage message = new ProtocolMessage();
-        message.setType(ProtocolConstants.TYPE_SESSION_END);
+    public static ProtocolMessage sessionFinish(String sessionId, String senderDeviceId) {
+        ProtocolMessage message = base(ProtocolConstants.TYPE_SESSION_FINISH);
         message.setSessionId(sessionId);
+        message.setDeviceId(senderDeviceId);
         return message;
     }
 
-    public static ProtocolMessage sessionClosed(String sessionId) {
-        ProtocolMessage message = new ProtocolMessage();
-        message.setType(ProtocolConstants.TYPE_SESSION_CLOSED);
+    public static ProtocolMessage sessionFinishAck(
+        String sessionId,
+        String localDeviceId,
+        String localDeviceName,
+        String localDeviceType
+    ) {
+        ProtocolMessage message = base(ProtocolConstants.TYPE_SESSION_FINISH_ACK);
         message.setSessionId(sessionId);
+        message.setDeviceId(localDeviceId);
+        message.setDeviceName(localDeviceName);
+        message.setDeviceType(localDeviceType);
         return message;
     }
 
@@ -110,7 +152,7 @@ public class ProtocolMessage {
         } catch (EOFException exception) {
             throw exception;
         }
-        if (headerLength <= 0 || headerLength > 1024 * 1024) {
+        if (headerLength <= 0 || headerLength > ProtocolConstants.MAX_HEADER_BYTES) {
             throw new IOException("Invalid protocol header length: " + headerLength);
         }
         byte[] headerBytes = inputStream.readNBytes(headerLength);
@@ -122,9 +164,21 @@ public class ProtocolMessage {
 
     public static void write(DataOutputStream outputStream, ProtocolMessage message) throws IOException {
         byte[] headerBytes = ProtocolJson.mapper().writeValueAsString(message).getBytes(StandardCharsets.UTF_8);
+        if (headerBytes.length > ProtocolConstants.MAX_HEADER_BYTES) {
+            throw new IOException("Protocol header exceeds " + ProtocolConstants.MAX_HEADER_BYTES + " bytes.");
+        }
         outputStream.writeInt(headerBytes.length);
         outputStream.write(headerBytes);
         outputStream.flush();
+    }
+
+    private static ProtocolMessage base(String type) {
+        ProtocolMessage message = new ProtocolMessage();
+        message.setType(type);
+        message.setProtocolVersion(ProtocolConstants.PROTOCOL_VERSION);
+        message.setMessageId(UUID.randomUUID().toString());
+        message.setTimestamp(System.currentTimeMillis());
+        return message;
     }
 
     public String getType() {
@@ -143,6 +197,14 @@ public class ProtocolMessage {
         this.protocolVersion = protocolVersion;
     }
 
+    public String getMessageId() {
+        return messageId;
+    }
+
+    public void setMessageId(String messageId) {
+        this.messageId = messageId;
+    }
+
     public String getSessionId() {
         return sessionId;
     }
@@ -151,36 +213,68 @@ public class ProtocolMessage {
         this.sessionId = sessionId;
     }
 
-    public String getSenderDeviceId() {
-        return senderDeviceId;
-    }
-
-    public void setSenderDeviceId(String senderDeviceId) {
-        this.senderDeviceId = senderDeviceId;
-    }
-
-    public String getSenderDeviceName() {
-        return senderDeviceName;
-    }
-
-    public void setSenderDeviceName(String senderDeviceName) {
-        this.senderDeviceName = senderDeviceName;
-    }
-
-    public Integer getFileCount() {
-        return fileCount;
-    }
-
-    public void setFileCount(Integer fileCount) {
-        this.fileCount = fileCount;
-    }
-
     public String getFileId() {
         return fileId;
     }
 
     public void setFileId(String fileId) {
         this.fileId = fileId;
+    }
+
+    public String getDeviceId() {
+        return deviceId;
+    }
+
+    public void setDeviceId(String deviceId) {
+        this.deviceId = deviceId;
+    }
+
+    public String getDeviceName() {
+        return deviceName;
+    }
+
+    public void setDeviceName(String deviceName) {
+        this.deviceName = deviceName;
+    }
+
+    public String getDeviceType() {
+        return deviceType;
+    }
+
+    public void setDeviceType(String deviceType) {
+        this.deviceType = deviceType;
+    }
+
+    public String getStatus() {
+        return status;
+    }
+
+    public void setStatus(String status) {
+        this.status = status;
+    }
+
+    public Integer getTcpPort() {
+        return tcpPort;
+    }
+
+    public void setTcpPort(Integer tcpPort) {
+        this.tcpPort = tcpPort;
+    }
+
+    public List<String> getCapabilities() {
+        return capabilities;
+    }
+
+    public void setCapabilities(List<String> capabilities) {
+        this.capabilities = capabilities == null ? null : new ArrayList<>(capabilities);
+    }
+
+    public Long getTimestamp() {
+        return timestamp;
+    }
+
+    public void setTimestamp(Long timestamp) {
+        this.timestamp = timestamp;
     }
 
     public String getRelativePath() {
@@ -207,6 +301,22 @@ public class ProtocolMessage {
         this.size = size;
     }
 
+    public Long getTotalSize() {
+        return totalSize;
+    }
+
+    public void setTotalSize(Long totalSize) {
+        this.totalSize = totalSize;
+    }
+
+    public String getSha256() {
+        return sha256;
+    }
+
+    public void setSha256(String sha256) {
+        this.sha256 = sha256;
+    }
+
     public Long getLastModified() {
         return lastModified;
     }
@@ -215,20 +325,36 @@ public class ProtocolMessage {
         this.lastModified = lastModified;
     }
 
-    public String getStatus() {
-        return status;
+    public Integer getTotalFiles() {
+        return totalFiles;
     }
 
-    public void setStatus(String status) {
-        this.status = status;
+    public void setTotalFiles(Integer totalFiles) {
+        this.totalFiles = totalFiles;
     }
 
-    public String getMessage() {
-        return message;
+    public String getReason() {
+        return reason;
     }
 
-    public void setMessage(String message) {
-        this.message = message;
+    public void setReason(String reason) {
+        this.reason = reason;
+    }
+
+    public String getErrorCode() {
+        return errorCode;
+    }
+
+    public void setErrorCode(String errorCode) {
+        this.errorCode = errorCode;
+    }
+
+    public Boolean getChecksumOk() {
+        return checksumOk;
+    }
+
+    public void setChecksumOk(Boolean checksumOk) {
+        this.checksumOk = checksumOk;
     }
 
     public String getSavedAs() {
@@ -237,5 +363,37 @@ public class ProtocolMessage {
 
     public void setSavedAs(String savedAs) {
         this.savedAs = savedAs;
+    }
+
+    public String getSenderDeviceId() {
+        return deviceId;
+    }
+
+    public void setSenderDeviceId(String senderDeviceId) {
+        this.deviceId = senderDeviceId;
+    }
+
+    public String getSenderDeviceName() {
+        return deviceName;
+    }
+
+    public void setSenderDeviceName(String senderDeviceName) {
+        this.deviceName = senderDeviceName;
+    }
+
+    public Integer getFileCount() {
+        return totalFiles;
+    }
+
+    public void setFileCount(Integer fileCount) {
+        this.totalFiles = fileCount;
+    }
+
+    public String getMessage() {
+        return reason;
+    }
+
+    public void setMessage(String message) {
+        this.reason = message;
     }
 }

@@ -2,6 +2,7 @@ package com.localdrop.ui;
 
 import com.localdrop.i18n.AppLanguage;
 import com.localdrop.i18n.I18n;
+import com.localdrop.protocol.ProtocolConstants;
 import com.localdrop.protocol.discovery.DeviceInfo;
 import com.localdrop.transfer.RecentlyReceivedItem;
 import com.localdrop.transfer.TransferQueueItem;
@@ -471,7 +472,7 @@ public class MainView {
                 row.getStyleClass().add("selected");
             }
 
-            StackPane icon = statusIcon("PHONE".equalsIgnoreCase(item.getDeviceType()) ? "PH" : "PC", Color.web("#2b7cff"));
+            StackPane icon = statusIcon(ProtocolConstants.DEVICE_TYPE_ANDROID.equalsIgnoreCase(item.getDeviceType()) ? "AN" : "PC", Color.web("#2b7cff"));
 
             VBox textBox = new VBox(6);
             HBox.setHgrow(textBox, Priority.ALWAYS);

@@ -5,6 +5,7 @@ import com.localdrop.config.ConfigService;
 import com.localdrop.discovery.DiscoveryService;
 import com.localdrop.i18n.AppLanguage;
 import com.localdrop.i18n.I18n;
+import com.localdrop.protocol.ProtocolConstants;
 import com.localdrop.protocol.discovery.DeviceInfo;
 import com.localdrop.transfer.RecentlyReceivedItem;
 import com.localdrop.transfer.TransferClient;
@@ -91,7 +92,12 @@ public class MainController {
     }
 
     public void startServices() throws IOException {
-        transferServer = new TransferServer(configService::getReceiveFolder, new TransferServer.Listener() {
+        transferServer = new TransferServer(
+            configService::getReceiveFolder,
+            config.getDeviceId(),
+            deviceName,
+            ProtocolConstants.DEVICE_TYPE_WINDOWS,
+            new TransferServer.Listener() {
             @Override
             public void onReceiveCompleted(RecentlyReceivedItem item) {
                 Platform.runLater(() -> {
@@ -130,7 +136,7 @@ public class MainController {
             discoveryService = new DiscoveryService(
                 config.getDeviceId(),
                 deviceName,
-                "PC",
+                ProtocolConstants.DEVICE_TYPE_WINDOWS,
                 transferServer.getBoundPort(),
                 snapshot -> Platform.runLater(() -> applyDeviceSnapshot(snapshot))
             );
@@ -304,6 +310,7 @@ public class MainController {
             selectedDevice,
             config.getDeviceId(),
             deviceName,
+            ProtocolConstants.DEVICE_TYPE_WINDOWS,
             pendingItems,
             new TransferClient.Listener() {
                 @Override
