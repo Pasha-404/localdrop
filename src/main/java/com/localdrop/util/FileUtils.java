@@ -1,6 +1,7 @@
 package com.localdrop.util;
 
 import com.localdrop.protocol.ProtocolConstants;
+import com.localdrop.transfer.TransferException;
 
 import java.awt.Desktop;
 import java.io.IOException;
@@ -90,22 +91,22 @@ public final class FileUtils {
         validateFileName(fileName);
         String candidate = relativePath == null || relativePath.isBlank() ? fileName : relativePath.trim();
         if (candidate.length() > ProtocolConstants.MAX_RELATIVE_PATH_LENGTH) {
-            throw new IOException("Relative path is too long.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Relative path is too long.");
         }
         if (candidate.indexOf('\0') >= 0 || candidate.startsWith("/") || candidate.startsWith("\\")) {
-            throw new IOException("Relative path is not safe.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Relative path is not safe.");
         }
         if (candidate.matches("^[A-Za-z]:.*") || candidate.startsWith("//") || candidate.startsWith("\\\\")) {
-            throw new IOException("Absolute paths are not allowed.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Absolute paths are not allowed.");
         }
 
         String normalizedSeparators = candidate.replace('\\', '/');
         Path normalized = Paths.get(normalizedSeparators).normalize();
         if (normalized.isAbsolute() || normalized.getNameCount() == 0 || normalized.startsWith("..")) {
-            throw new IOException("Relative path is not safe.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Relative path is not safe.");
         }
         if (normalized.getNameCount() > ProtocolConstants.MAX_RELATIVE_PATH_DEPTH) {
-            throw new IOException("Relative path is too deep.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Relative path is too deep.");
         }
 
         Set<String> seenSegments = new HashSet<>();
@@ -115,9 +116,37 @@ public final class FileUtils {
             seenSegments.add(segment);
         }
         if (seenSegments.isEmpty()) {
-            throw new IOException("Relative path is empty.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Relative path is empty.");
         }
         return normalized;
+    }
+
+    public static void cleanupPartialFiles(Path root, long olderThanMillis) {
+        if (root == null) {
+            return;
+        }
+
+        Instant cutoff = Instant.now().minusMillis(Math.max(0, olderThanMillis));
+        try {
+            if (!Files.exists(root) || !Files.isDirectory(root)) {
+                return;
+            }
+            try (var stream = Files.walk(root)) {
+                stream.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().endsWith(".localdrop-part"))
+                    .forEach(path -> {
+                        try {
+                            if (Files.getLastModifiedTime(path).toInstant().isBefore(cutoff)) {
+                                Files.deleteIfExists(path);
+                            }
+                        } catch (IOException ignored) {
+                            // Cleanup is best-effort only.
+                        }
+                    });
+            }
+        } catch (IOException ignored) {
+            // Cleanup is best-effort only.
+        }
     }
 
     public static Path ensureUniqueFile(Path target) {
@@ -195,28 +224,28 @@ public final class FileUtils {
 
     private static void validateFileName(String fileName) throws IOException {
         if (fileName == null || fileName.isBlank()) {
-            throw new IOException("File name is empty.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_NAME, "File name is empty.");
         }
         if (fileName.length() > ProtocolConstants.MAX_FILE_NAME_LENGTH) {
-            throw new IOException("File name is too long.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_NAME, "File name is too long.");
         }
         if (fileName.contains("/") || fileName.contains("\\") || fileName.indexOf('\0') >= 0) {
-            throw new IOException("File name contains invalid characters.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_NAME, "File name contains invalid characters.");
         }
         validatePathSegment(fileName);
     }
 
     private static void validatePathSegment(String segment) throws IOException {
         if (segment == null || segment.isBlank() || ".".equals(segment) || "..".equals(segment)) {
-            throw new IOException("Path contains an empty or unsafe segment.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Path contains an empty or unsafe segment.");
         }
         if (segment.endsWith(" ") || segment.endsWith(".")) {
-            throw new IOException("Windows path segment cannot end with a space or dot.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Windows path segment cannot end with a space or dot.");
         }
         for (int index = 0; index < segment.length(); index++) {
             char ch = segment.charAt(index);
             if (Character.isISOControl(ch) || "<>:\"|?*".indexOf(ch) >= 0) {
-                throw new IOException("Path segment contains invalid characters.");
+                throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Path segment contains invalid characters.");
             }
         }
         String stem = segment;
@@ -225,7 +254,7 @@ public final class FileUtils {
             stem = stem.substring(0, extensionIndex);
         }
         if (WINDOWS_RESERVED_NAMES.contains(stem.toUpperCase(Locale.ROOT))) {
-            throw new IOException("Path segment uses a reserved Windows name.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_NAME, "Path segment uses a reserved Windows name.");
         }
     }
 

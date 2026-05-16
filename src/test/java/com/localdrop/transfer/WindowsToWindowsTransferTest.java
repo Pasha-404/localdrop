@@ -1,5 +1,6 @@
 package com.localdrop.transfer;
 
+import com.localdrop.diagnostics.DiagnosticsService;
 import com.localdrop.protocol.ProtocolConstants;
 import com.localdrop.protocol.discovery.DeviceInfo;
 import org.junit.jupiter.api.Test;
@@ -30,6 +31,11 @@ class WindowsToWindowsTransferTest {
         Files.writeString(sourceFile, "Hello from Windows");
 
         AtomicReference<RecentlyReceivedItem> receivedItem = new AtomicReference<>();
+        DiagnosticsService diagnosticsService = new DiagnosticsService(
+            "receiver-windows-id",
+            "Receiver Windows",
+            ProtocolConstants.DEVICE_TYPE_WINDOWS
+        );
         TransferServer server = new TransferServer(
             () -> receiverDir,
             "receiver-windows-id",
@@ -50,7 +56,8 @@ class WindowsToWindowsTransferTest {
                 public void onReceivingFrom(String senderDeviceName) {
                     // No UI in this integration test.
                 }
-            }
+            },
+            diagnosticsService
         );
 
         try {
@@ -73,7 +80,7 @@ class WindowsToWindowsTransferTest {
             );
 
             AtomicReference<String> transferIssue = new AtomicReference<>();
-            new TransferClient().sendFiles(
+            new TransferClient(diagnosticsService).sendFiles(
                 target,
                 "sender-windows-id",
                 "Sender Windows",

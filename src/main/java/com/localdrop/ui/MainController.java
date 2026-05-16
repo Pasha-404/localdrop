@@ -2,6 +2,7 @@ package com.localdrop.ui;
 
 import com.localdrop.config.AppConfig;
 import com.localdrop.config.ConfigService;
+import com.localdrop.diagnostics.DiagnosticsService;
 import com.localdrop.discovery.DiscoveryService;
 import com.localdrop.i18n.AppLanguage;
 import com.localdrop.i18n.I18n;
@@ -30,7 +31,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -49,6 +52,7 @@ public class MainController {
     private final ConfigService configService;
     private final AppConfig config;
     private final String deviceName;
+    private final DiagnosticsService diagnosticsService;
     private final ObservableList<DeviceInfo> devices = FXCollections.observableArrayList();
     private final ObservableList<TransferQueueItem> queueItems = FXCollections.observableArrayList();
     private final ObservableList<RecentlyReceivedItem> recentItems = FXCollections.observableArrayList();
@@ -58,13 +62,15 @@ public class MainController {
         return thread;
     });
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
-    private final TransferClient transferClient = new TransferClient();
     private final I18n i18n;
     private final MainView view = new MainView(devices, queueItems, recentItems);
+    private final TransferClient transferClient;
+    private final Map<String, Long> busyVisibilitySince = new HashMap<>();
 
     private Stage stage;
     private TransferServer transferServer;
     private DiscoveryService discoveryService;
+    private List<DeviceInfo> latestDiscoverySnapshot = List.of();
     private volatile boolean transferInProgress;
     private ReceiveActivity receiveActivity = ReceiveActivity.READY;
     private String receiveActivityArgument;
@@ -74,6 +80,8 @@ public class MainController {
         this.config = config;
         this.deviceName = deviceName;
         this.i18n = new I18n(AppLanguage.fromCode(config.getLanguage()));
+        this.diagnosticsService = new DiagnosticsService(config.getDeviceId(), deviceName, ProtocolConstants.DEVICE_TYPE_WINDOWS);
+        this.transferClient = new TransferClient(diagnosticsService);
         wireUi();
     }
 
@@ -112,14 +120,24 @@ public class MainController {
 
             @Override
             public void onReadyToReceive() {
-                Platform.runLater(() -> setReceiveActivity(ReceiveActivity.READY, null));
+                Platform.runLater(() -> {
+                    setReceiveActivity(ReceiveActivity.READY, null);
+                    if (discoveryService != null) {
+                        discoveryService.refreshNow();
+                    }
+                });
             }
 
             @Override
             public void onReceivingFrom(String senderDeviceName) {
-                Platform.runLater(() -> setReceiveActivity(ReceiveActivity.RECEIVING_FROM, senderDeviceName));
+                Platform.runLater(() -> {
+                    setReceiveActivity(ReceiveActivity.RECEIVING_FROM, senderDeviceName);
+                    if (discoveryService != null) {
+                        discoveryService.refreshNow();
+                    }
+                });
             }
-        });
+        }, diagnosticsService);
 
         boolean receiveAvailable = false;
         try {
@@ -128,6 +146,7 @@ public class MainController {
             setReceiveActivity(ReceiveActivity.READY, null);
         } catch (IOException exception) {
             logger.severe("Unable to start receive service: " + exception.getMessage());
+            diagnosticsService.setTransferServerStatus("ERROR", ProtocolConstants.ERROR_TRANSFER_PORT_UNAVAILABLE);
             setReceiveActivity(ReceiveActivity.UNAVAILABLE, null);
             view.updateInlineError(i18n.format("errors.receiveService", exception.getMessage()));
         }
@@ -138,13 +157,17 @@ public class MainController {
                 deviceName,
                 ProtocolConstants.DEVICE_TYPE_WINDOWS,
                 transferServer.getBoundPort(),
+                this::resolveLocalDiscoveryStatus,
                 snapshot -> Platform.runLater(() -> applyDeviceSnapshot(snapshot))
+                ,
+                diagnosticsService
             );
 
             try {
                 discoveryService.start();
             } catch (IOException exception) {
                 logger.severe("Unable to start device discovery: " + exception.getMessage());
+                diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
                 view.updateInlineError(i18n.format("errors.discoveryService", exception.getMessage()));
             }
         }
@@ -180,6 +203,16 @@ public class MainController {
                 discoveryService.refreshNow();
             }
         });
+        view.getDiagnosticsButton().setOnAction(event -> Dialogs.showDiagnostics(
+            stage,
+            i18n,
+            () -> diagnosticsService.formatSnapshot(i18n),
+            () -> {
+                if (discoveryService != null) {
+                    discoveryService.refreshNow();
+                }
+            }
+        ));
         view.getAddFilesButton().setOnAction(event -> chooseFiles());
         view.getAddFolderButton().setOnAction(event -> chooseFolder());
         view.getSendButton().setOnAction(event -> sendQueue());
@@ -302,12 +335,21 @@ public class MainController {
             return;
         }
 
+        DiscoveryService.SendTargetResolution resolution = discoveryService == null
+            ? new DiscoveryService.SendTargetResolution(null, ProtocolConstants.DIAGNOSTIC_TRANSFER_CLIENT_NOT_STARTED, "Discovery is not running.")
+            : discoveryService.resolveSendTarget(selectedDevice.getDeviceId());
+        if (!resolution.canSend()) {
+            view.updateInlineError(resolveSendTargetMessage(resolution));
+            updateSendButtonState();
+            return;
+        }
+
         transferInProgress = true;
         view.updateInlineError("");
         updateSendButtonState();
 
         backgroundExecutor.submit(() -> transferClient.sendFiles(
-            selectedDevice,
+            resolution.device(),
             config.getDeviceId(),
             deviceName,
             ProtocolConstants.DEVICE_TYPE_WINDOWS,
@@ -391,6 +433,9 @@ public class MainController {
             configService.updateReceiveFolder(folder.toPath().toAbsolutePath().normalize());
             view.updateReceiveFolder(configService.getReceiveFolder());
             view.updateInlineError("");
+            if (discoveryService != null) {
+                discoveryService.refreshNow();
+            }
         } catch (IOException exception) {
             logger.warning("Failed to save receive folder: " + exception.getMessage());
             view.updateInlineError(i18n.text("errors.saveReceiveFolder"));
@@ -409,14 +454,29 @@ public class MainController {
     }
 
     private void applyDeviceSnapshot(List<DeviceInfo> snapshot) {
-        if (isSameDeviceSnapshot(snapshot)) {
+        latestDiscoverySnapshot = List.copyOf(snapshot);
+        long now = System.currentTimeMillis();
+        Map<String, DeviceInfo> currentlyVisibleById = new HashMap<>();
+        for (DeviceInfo device : devices) {
+            currentlyVisibleById.put(device.getDeviceId(), device);
+        }
+
+        busyVisibilitySince.keySet().removeIf(deviceId -> latestDiscoverySnapshot.stream().noneMatch(device -> device.getDeviceId().equals(deviceId)));
+        List<DeviceInfo> visibleDevices = latestDiscoverySnapshot.stream()
+            .filter(device -> shouldDisplayInMainList(device, currentlyVisibleById.containsKey(device.getDeviceId()), now))
+            .sorted(Comparator.comparing(DeviceInfo::getDeviceName, String.CASE_INSENSITIVE_ORDER))
+            .toList();
+        diagnosticsService.setMainListDevicesCount(visibleDevices.size());
+
+        if (isSameDeviceSnapshot(visibleDevices)) {
+            updateSendButtonState();
             return;
         }
 
         DeviceInfo selectedDevice = view.getDeviceListView().getSelectionModel().getSelectedItem();
         String selectedDeviceId = selectedDevice == null ? null : selectedDevice.getDeviceId();
 
-        devices.setAll(snapshot);
+        devices.setAll(visibleDevices);
         if (selectedDeviceId != null) {
             for (DeviceInfo device : devices) {
                 if (selectedDeviceId.equals(device.getDeviceId())) {
@@ -427,6 +487,40 @@ public class MainController {
         }
         view.refreshDevices();
         updateSendButtonState();
+    }
+
+    private boolean shouldDisplayInMainList(DeviceInfo device, boolean wasVisible, long now) {
+        if (isLiveAndReady(device, now)) {
+            busyVisibilitySince.remove(device.getDeviceId());
+            return true;
+        }
+
+        if (ProtocolConstants.STATUS_BUSY.equalsIgnoreCase(device.getStatus()) && wasVisible && isWithinDisplayGrace(device, now)) {
+            long startedAt = busyVisibilitySince.computeIfAbsent(device.getDeviceId(), ignored -> {
+                scheduleDeviceListReevaluation(ProtocolConstants.MAIN_LIST_NOT_READY_GRACE_MS + 150);
+                return now;
+            });
+            return now - startedAt <= ProtocolConstants.MAIN_LIST_NOT_READY_GRACE_MS;
+        }
+
+        busyVisibilitySince.remove(device.getDeviceId());
+        return false;
+    }
+
+    private boolean isLiveAndReady(DeviceInfo device, long now) {
+        long age = now - device.getLastSeenAt();
+        if (age > ProtocolConstants.DISCOVERY_DEVICE_TIMEOUT_MILLIS) {
+            return false;
+        }
+        return device.getStatus() == null
+            || device.getStatus().isBlank()
+            || ProtocolConstants.STATUS_READY.equalsIgnoreCase(device.getStatus())
+            || ProtocolConstants.STATUS_READY_COMPAT.equalsIgnoreCase(device.getStatus());
+    }
+
+    private boolean isWithinDisplayGrace(DeviceInfo device, long now) {
+        return now - device.getLastSeenAt()
+            <= ProtocolConstants.DISCOVERY_DEVICE_TIMEOUT_MILLIS + ProtocolConstants.MAIN_LIST_EXPIRE_GRACE_MS;
     }
 
     private boolean isSameDeviceSnapshot(List<DeviceInfo> snapshot) {
@@ -505,8 +599,62 @@ public class MainController {
             disabled = true;
         } else {
             buttonText = i18n.format("sending.button.sendTo", selectedDevice.getDeviceName());
-            disabled = pendingCount == 0;
+            boolean canSend = discoveryService != null && discoveryService.resolveSendTarget(selectedDevice.getDeviceId()).canSend();
+            disabled = pendingCount == 0 || !canSend;
         }
         view.updateSendButton(buttonText, disabled);
+    }
+
+    private String resolveLocalDiscoveryStatus() {
+        if (transferServer == null || !transferServer.isRunning()) {
+            return ProtocolConstants.STATUS_TRANSFER_PORT_UNAVAILABLE;
+        }
+        if (transferServer.isBusy()) {
+            return ProtocolConstants.STATUS_BUSY;
+        }
+
+        Path receiveFolder = configService.getReceiveFolder();
+        if (receiveFolder == null) {
+            return ProtocolConstants.STATUS_RECEIVE_FOLDER_NOT_SELECTED;
+        }
+
+        try {
+            Files.createDirectories(receiveFolder);
+            return Files.isWritable(receiveFolder)
+                ? ProtocolConstants.STATUS_READY
+                : ProtocolConstants.STATUS_RECEIVE_FOLDER_NOT_WRITABLE;
+        } catch (IOException exception) {
+            return ProtocolConstants.STATUS_RECEIVE_FOLDER_NOT_WRITABLE;
+        }
+    }
+
+    private void scheduleDeviceListReevaluation(long delayMillis) {
+        backgroundExecutor.submit(() -> {
+            try {
+                Thread.sleep(delayMillis);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (!shutdown.get()) {
+                Platform.runLater(() -> applyDeviceSnapshot(latestDiscoverySnapshot));
+            }
+        });
+    }
+
+    private String resolveSendTargetMessage(DiscoveryService.SendTargetResolution resolution) {
+        if (resolution == null || resolution.errorCode() == null) {
+            return i18n.text("errors.receiverRejected");
+        }
+        return switch (resolution.errorCode()) {
+            case ProtocolConstants.DIAGNOSTIC_DEVICE_NOT_FOUND,
+                 ProtocolConstants.DIAGNOSTIC_DEVICE_NOT_LIVE,
+                 ProtocolConstants.DIAGNOSTIC_STALE_DEVICE_ADDRESS -> i18n.text("errors.deviceNotLive");
+            case ProtocolConstants.DIAGNOSTIC_DEVICE_NOT_READY -> i18n.text("errors.deviceNotReady");
+            case ProtocolConstants.DIAGNOSTIC_TRANSFER_CLIENT_NOT_STARTED -> i18n.text("errors.discoveryNotRunning");
+            default -> resolution.message() == null || resolution.message().isBlank()
+                ? resolution.errorCode()
+                : resolution.message();
+        };
     }
 }

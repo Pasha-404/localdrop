@@ -44,6 +44,7 @@ public class MainView {
     private final ListView<RecentlyReceivedItem> recentListView = new ListView<>();
     private final VBox dropArea = new VBox(8);
     private final Button refreshButton = new Button();
+    private final Button diagnosticsButton = new Button();
     private final Button addFilesButton = new Button();
     private final Button addFolderButton = new Button();
     private final Button sendButton = new Button();
@@ -114,6 +115,10 @@ public class MainView {
 
     public Button getAddFilesButton() {
         return addFilesButton;
+    }
+
+    public Button getDiagnosticsButton() {
+        return diagnosticsButton;
     }
 
     public Button getAddFolderButton() {
@@ -224,6 +229,7 @@ public class MainView {
 
         devicesTitleLabel.setText(i18n.text("devices.title"));
         refreshButton.setText(i18n.text("devices.refresh"));
+        diagnosticsButton.setText(i18n.text("devices.diagnostics"));
         devicesHelperLabel.setText(i18n.text("devices.helper"));
         deviceEmptyLabel.setText(i18n.text("devices.empty"));
 
@@ -307,6 +313,7 @@ public class MainView {
         card.getChildren().add(titleRow(devicesTitleLabel));
 
         refreshButton.getStyleClass().add("secondary-button");
+        diagnosticsButton.getStyleClass().add("secondary-button");
 
         devicesHelperLabel.getStyleClass().add("helper-text");
         devicesHelperLabel.setWrapText(true);
@@ -315,7 +322,8 @@ public class MainView {
         deviceListView.setPlaceholder(deviceEmptyLabel);
         VBox.setVgrow(deviceListView, Priority.ALWAYS);
 
-        card.getChildren().addAll(refreshButton, devicesHelperLabel, deviceListView);
+        HBox actionsRow = new HBox(10, refreshButton, diagnosticsButton);
+        card.getChildren().addAll(actionsRow, devicesHelperLabel, deviceListView);
         return card;
     }
 
@@ -486,9 +494,7 @@ public class MainView {
             Label onlineLabel = new Label(i18n.text("device.online"));
             onlineLabel.getStyleClass().add("subtle-chip");
 
-            Label statusLabel = new Label("READY".equalsIgnoreCase(item.getStatus())
-                ? i18n.text("device.ready")
-                : i18n.text("device.online"));
+            Label statusLabel = new Label(resolveDeviceStatusText(item));
             statusLabel.getStyleClass().add("ready-text");
 
             textBox.getChildren().addAll(nameLabel, onlineLabel, statusLabel);
@@ -496,6 +502,22 @@ public class MainView {
             row.getChildren().addAll(icon, textBox);
             setGraphic(row);
             setContentDisplay(ContentDisplay.GRAPHIC_ONLY);
+        }
+
+        private String resolveDeviceStatusText(DeviceInfo item) {
+            String status = item.getStatus();
+            if (status == null || status.isBlank() || ProtocolConstants.STATUS_READY.equalsIgnoreCase(status)) {
+                return i18n.text("device.ready");
+            }
+            return switch (status.toUpperCase()) {
+                case ProtocolConstants.STATUS_BUSY -> i18n.text("device.busy");
+                case ProtocolConstants.STATUS_NOT_READY,
+                     ProtocolConstants.STATUS_RECEIVE_FOLDER_NOT_SELECTED,
+                     ProtocolConstants.STATUS_RECEIVE_FOLDER_NOT_WRITABLE,
+                     ProtocolConstants.STATUS_TRANSFER_PORT_UNAVAILABLE,
+                     ProtocolConstants.STATUS_UNKNOWN -> i18n.text("device.notReady");
+                default -> i18n.text("device.online");
+            };
         }
     }
 

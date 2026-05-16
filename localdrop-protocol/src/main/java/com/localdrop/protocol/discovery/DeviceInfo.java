@@ -1,7 +1,5 @@
 package com.localdrop.protocol.discovery;
 
-import com.localdrop.protocol.ProtocolConstants;
-
 import java.util.ArrayList;
 import java.util.List;
 
@@ -72,6 +70,13 @@ public class DeviceInfo {
     }
 
     public String getStatusLabel() {
-        return ProtocolConstants.STATUS_READY.equalsIgnoreCase(status) ? "Ready" : "Online";
+        if (status == null || status.isBlank()) {
+            return "Ready";
+        }
+        return switch (status.toUpperCase()) {
+            case "READY", "READY_COMPAT" -> "Ready";
+            case "BUSY" -> "Busy";
+            default -> "Online";
+        };
     }
 }

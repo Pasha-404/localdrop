@@ -21,19 +21,30 @@ public class DiscoveryMessage {
     public DiscoveryMessage() {
     }
 
-    public static DiscoveryMessage create(String deviceId, String deviceName, String deviceType, int tcpPort) {
+    public static DiscoveryMessage create(
+        String deviceId,
+        String deviceName,
+        String deviceType,
+        String status,
+        int tcpPort,
+        List<String> capabilities
+    ) {
         DiscoveryMessage message = new DiscoveryMessage();
         message.setType(ProtocolConstants.TYPE_DISCOVERY);
         message.setProtocolVersion(ProtocolConstants.PROTOCOL_VERSION);
         message.setDeviceId(deviceId);
         message.setDeviceName(deviceName);
         message.setDeviceType(deviceType);
-        message.setStatus(ProtocolConstants.STATUS_READY);
+        message.setStatus(status == null || status.isBlank() ? ProtocolConstants.STATUS_READY : status);
         message.setTcpPort(tcpPort);
-        message.setCapabilities(ProtocolConstants.CAPABILITIES);
+        message.setCapabilities(capabilities);
         message.setMessageId(UUID.randomUUID().toString());
         message.setTimestamp(System.currentTimeMillis());
         return message;
+    }
+
+    public static DiscoveryMessage create(String deviceId, String deviceName, String deviceType, int tcpPort) {
+        return create(deviceId, deviceName, deviceType, ProtocolConstants.STATUS_READY, tcpPort, ProtocolConstants.CAPABILITIES);
     }
 
     public String getType() {

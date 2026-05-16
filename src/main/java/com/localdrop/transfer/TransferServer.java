@@ -1,5 +1,8 @@
 package com.localdrop.transfer;
 
+import com.localdrop.diagnostics.DiagnosticDirection;
+import com.localdrop.diagnostics.DiagnosticEventType;
+import com.localdrop.diagnostics.DiagnosticsService;
 import com.localdrop.protocol.ProtocolConstants;
 import com.localdrop.protocol.transfer.ProtocolMessage;
 import com.localdrop.util.FileUtils;
@@ -13,6 +16,8 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalTime;
@@ -40,6 +45,7 @@ public class TransferServer {
     private final String localDeviceName;
     private final String localDeviceType;
     private final Listener listener;
+    private final DiagnosticsService diagnosticsService;
     private final ExecutorService acceptExecutor = Executors.newSingleThreadExecutor(r -> new Thread(r, "localdrop-transfer-accept"));
     private final ExecutorService clientExecutor = Executors.newFixedThreadPool(4, r -> new Thread(r, "localdrop-transfer-client"));
     private final AtomicBoolean activeIncomingTransfer = new AtomicBoolean(false);
@@ -53,13 +59,15 @@ public class TransferServer {
         String localDeviceId,
         String localDeviceName,
         String localDeviceType,
-        Listener listener
+        Listener listener,
+        DiagnosticsService diagnosticsService
     ) {
         this.receiveFolderSupplier = receiveFolderSupplier;
         this.localDeviceId = localDeviceId;
         this.localDeviceName = localDeviceName;
         this.localDeviceType = localDeviceType;
         this.listener = listener;
+        this.diagnosticsService = diagnosticsService;
     }
 
     public void start() throws IOException {
@@ -68,7 +76,7 @@ public class TransferServer {
         }
 
         IOException lastError = null;
-        for (int port = DEFAULT_PORT; port < DEFAULT_PORT + 20; port++) {
+        for (int port = DEFAULT_PORT; port <= ProtocolConstants.WINDOWS_TRANSFER_PORT_MAX; port++) {
             try {
                 serverSocket = new ServerSocket(port);
                 boundPort = port;
@@ -79,10 +87,36 @@ public class TransferServer {
         }
 
         if (serverSocket == null) {
+            diagnosticsService.setTransferServerStatus("ERROR", ProtocolConstants.ERROR_TRANSFER_PORT_UNAVAILABLE);
+            diagnosticsService.recordTransferEvent(
+                DiagnosticEventType.TRANSFER_SERVER_ERROR,
+                DiagnosticDirection.INTERNAL,
+                null,
+                localDeviceId,
+                localDeviceName,
+                localDeviceType,
+                ProtocolConstants.STATUS_TRANSFER_PORT_UNAVAILABLE,
+                ProtocolConstants.ERROR_TRANSFER_PORT_UNAVAILABLE,
+                "Unable to bind TCP receive server."
+            );
             throw Objects.requireNonNullElseGet(lastError, () -> new IOException("Unable to bind TCP server"));
         }
 
         running = true;
+        cleanupPartialFiles();
+        diagnosticsService.setTransferPort(boundPort);
+        diagnosticsService.setTransferServerStatus("RUNNING", null);
+        diagnosticsService.recordTransferEvent(
+            DiagnosticEventType.TRANSFER_SERVER_STARTED,
+            DiagnosticDirection.INTERNAL,
+            null,
+            localDeviceId,
+            localDeviceName,
+            localDeviceType,
+            ProtocolConstants.STATUS_READY,
+            null,
+            "TCP transfer server started."
+        );
         acceptExecutor.submit(this::acceptLoop);
         logger.info("TCP transfer server v2-open started on port " + boundPort);
     }
@@ -92,6 +126,14 @@ public class TransferServer {
             throw new IllegalStateException("Transfer server has not been started.");
         }
         return boundPort;
+    }
+
+    public boolean isRunning() {
+        return running;
+    }
+
+    public boolean isBusy() {
+        return activeIncomingTransfer.get();
     }
 
     public void stop() {
@@ -105,6 +147,18 @@ public class TransferServer {
         }
         acceptExecutor.shutdownNow();
         clientExecutor.shutdownNow();
+        diagnosticsService.setTransferServerStatus("STOPPED", null);
+        diagnosticsService.recordTransferEvent(
+            DiagnosticEventType.TRANSFER_SERVER_STOPPED,
+            DiagnosticDirection.INTERNAL,
+            null,
+            localDeviceId,
+            localDeviceName,
+            localDeviceType,
+            null,
+            null,
+            "TCP transfer server stopped."
+        );
         logger.info("TCP transfer server stopped");
     }
 
@@ -115,6 +169,18 @@ public class TransferServer {
                 clientExecutor.submit(() -> handleClient(socket));
             } catch (IOException exception) {
                 if (running) {
+                    diagnosticsService.setTransferServerStatus("ERROR", ProtocolConstants.ERROR_CONNECTION_LOST);
+                    diagnosticsService.recordTransferEvent(
+                        DiagnosticEventType.TRANSFER_SERVER_ERROR,
+                        DiagnosticDirection.INTERNAL,
+                        null,
+                        localDeviceId,
+                        localDeviceName,
+                        localDeviceType,
+                        null,
+                        ProtocolConstants.ERROR_CONNECTION_LOST,
+                        exception.getMessage()
+                    );
                     logger.warning("Failed to accept incoming transfer: " + exception.getMessage());
                 }
             }
@@ -126,18 +192,18 @@ public class TransferServer {
         try (socket;
              DataInputStream input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
              DataOutputStream output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()))) {
-            socket.setSoTimeout(ProtocolConstants.CONTROL_READ_TIMEOUT_MS);
+            socket.setSoTimeout(ProtocolConstants.HEADER_READ_TIMEOUT_MS);
             ProtocolMessage sessionStart = ProtocolMessage.read(input);
             if (!Integer.valueOf(ProtocolConstants.PROTOCOL_VERSION).equals(sessionStart.getProtocolVersion())) {
-                writeSessionRejection(output, sessionStart.getSessionId(), ProtocolConstants.ERROR_VERSION_UNSUPPORTED);
+                writeSessionRejection(output, sessionStart.getSessionId(), ProtocolConstants.ERROR_PROTOCOL_VERSION_MISMATCH, "Protocol version mismatch.");
                 return;
             }
             if (!ProtocolConstants.TYPE_SESSION_START.equals(sessionStart.getType())) {
-                writeSessionRejection(output, sessionStart.getSessionId(), ProtocolConstants.ERROR_INVALID_MESSAGE);
+                writeSessionRejection(output, sessionStart.getSessionId(), ProtocolConstants.ERROR_MALFORMED_MESSAGE, "Expected SESSION_START.");
                 return;
             }
             if (!activeIncomingTransfer.compareAndSet(false, true)) {
-                writeSessionRejection(output, sessionStart.getSessionId(), ProtocolConstants.ERROR_BUSY);
+                writeSessionRejection(output, sessionStart.getSessionId(), ProtocolConstants.ERROR_SESSION_BUSY, "Receiver is busy.");
                 return;
             }
 
@@ -147,8 +213,9 @@ public class TransferServer {
                 try {
                     session = validateSessionStart(sessionStart);
                     receiveFolder = prepareReceiveFolder();
-                } catch (IOException exception) {
-                    writeSessionRejection(output, sessionStart.getSessionId(), errorCodeFor(exception));
+                    ensureUsableSpace(receiveFolder, session.totalSize());
+                } catch (TransferException exception) {
+                    writeSessionRejection(output, sessionStart.getSessionId(), exception.getErrorCode(), exception.getMessage());
                     throw exception;
                 }
 
@@ -159,31 +226,112 @@ public class TransferServer {
                     localDeviceType
                 ));
 
+                diagnosticsService.recordTransferEvent(
+                    DiagnosticEventType.TRANSFER_CLIENT_CONNECTED,
+                    DiagnosticDirection.IN,
+                    remoteAddress,
+                    session.senderDeviceId(),
+                    session.senderDeviceName(),
+                    null,
+                    ProtocolConstants.STATUS_READY,
+                    null,
+                    "Incoming transfer session accepted."
+                );
                 logger.info("Accepted transfer session " + session.sessionId() + " from " + session.senderDeviceName() + " (" + remoteAddress + ")");
                 listener.onReceivingFrom(session.senderDeviceName());
-                receiveTransferLoop(session, input, output, socket, receiveFolder);
+                receiveTransferLoop(session, input, output, socket, receiveFolder, remoteAddress);
             } finally {
                 activeIncomingTransfer.set(false);
                 listener.onReadyToReceive();
             }
+        } catch (SocketTimeoutException exception) {
+            diagnosticsService.recordTransferEvent(
+                DiagnosticEventType.TRANSFER_SERVER_ERROR,
+                DiagnosticDirection.INTERNAL,
+                remoteAddress,
+                null,
+                null,
+                null,
+                null,
+                ProtocolConstants.ERROR_HEADER_TIMEOUT,
+                exception.getMessage()
+            );
+            logger.warning("Transfer header timed out from " + remoteAddress + ": " + exception.getMessage());
         } catch (EOFException exception) {
+            diagnosticsService.recordTransferEvent(
+                DiagnosticEventType.TRANSFER_SERVER_ERROR,
+                DiagnosticDirection.INTERNAL,
+                remoteAddress,
+                null,
+                null,
+                null,
+                null,
+                ProtocolConstants.ERROR_CONNECTION_LOST,
+                exception.getMessage()
+            );
             logger.warning("Transfer connection closed unexpectedly from " + remoteAddress);
+        } catch (TransferException exception) {
+            diagnosticsService.recordTransferEvent(
+                DiagnosticEventType.TRANSFER_FILE_FAILED,
+                DiagnosticDirection.INTERNAL,
+                remoteAddress,
+                null,
+                null,
+                null,
+                null,
+                exception.getErrorCode(),
+                exception.getMessage()
+            );
+            logger.warning("Failed to receive file from " + remoteAddress + ": " + exception.getMessage());
         } catch (IOException exception) {
+            diagnosticsService.recordTransferEvent(
+                DiagnosticEventType.TRANSFER_SERVER_ERROR,
+                DiagnosticDirection.INTERNAL,
+                remoteAddress,
+                null,
+                null,
+                null,
+                null,
+                ProtocolConstants.ERROR_UNKNOWN,
+                exception.getMessage()
+            );
             logger.warning("Failed to receive file from " + remoteAddress + ": " + exception.getMessage());
         } catch (RuntimeException exception) {
+            diagnosticsService.recordTransferEvent(
+                DiagnosticEventType.TRANSFER_SERVER_ERROR,
+                DiagnosticDirection.INTERNAL,
+                remoteAddress,
+                null,
+                null,
+                null,
+                null,
+                ProtocolConstants.ERROR_MALFORMED_MESSAGE,
+                exception.getMessage()
+            );
             logger.warning("Rejected malformed TCP client from " + remoteAddress + ": " + exception.getMessage());
         }
     }
 
-    private TransferSession validateSessionStart(ProtocolMessage sessionStart) throws IOException {
-        if (isBlank(sessionStart.getSessionId()) || isBlank(sessionStart.getDeviceId()) || isBlank(sessionStart.getDeviceName())) {
-            throw new IOException("Invalid session start message.");
+    private TransferSession validateSessionStart(ProtocolMessage sessionStart) throws TransferException {
+        if (isBlank(sessionStart.getSessionId())) {
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_SESSION, "Session id is missing.");
+        }
+        if (isBlank(sessionStart.getDeviceId()) || isBlank(sessionStart.getDeviceName())) {
+            throw new TransferException(ProtocolConstants.ERROR_MALFORMED_MESSAGE, "Sender information is incomplete.");
         }
         int totalFiles = sessionStart.getTotalFiles() == null ? 0 : sessionStart.getTotalFiles();
         long totalSize = sessionStart.getTotalSize() == null ? -1 : sessionStart.getTotalSize();
-        if (totalFiles < 1 || totalFiles > ProtocolConstants.MAX_FILES_PER_SESSION
-            || totalSize < 0 || totalSize > ProtocolConstants.MAX_TOTAL_SESSION_BYTES) {
-            throw new IOException("Transfer session exceeds configured limits.");
+        if (totalFiles < 1) {
+            throw new TransferException(ProtocolConstants.ERROR_MALFORMED_MESSAGE, "Total file count is invalid.");
+        }
+        if (totalFiles > ProtocolConstants.MAX_FILES_PER_SESSION) {
+            throw new TransferException(ProtocolConstants.ERROR_TOO_MANY_FILES, "Transfer session exceeds the file count limit.");
+        }
+        if (totalSize < 0) {
+            throw new TransferException(ProtocolConstants.ERROR_MALFORMED_MESSAGE, "Total size is invalid.");
+        }
+        if (totalSize > ProtocolConstants.MAX_TOTAL_SESSION_BYTES) {
+            throw new TransferException(ProtocolConstants.ERROR_TOTAL_TRANSFER_TOO_LARGE, "Transfer session exceeds the total size limit.");
         }
         return new TransferSession(
             sessionStart.getSessionId(),
@@ -194,16 +342,35 @@ public class TransferServer {
         );
     }
 
-    private Path prepareReceiveFolder() throws IOException {
+    private Path prepareReceiveFolder() throws TransferException {
         Path receiveFolder = receiveFolderSupplier.get();
         if (receiveFolder == null) {
-            throw new IOException(ProtocolConstants.ERROR_RECEIVE_FOLDER_NOT_CONFIGURED);
+            throw new TransferException(ProtocolConstants.ERROR_RECEIVE_FOLDER_NOT_SELECTED, "Receive folder is not selected.");
         }
-        Files.createDirectories(receiveFolder);
+
+        try {
+            Files.createDirectories(receiveFolder);
+        } catch (IOException exception) {
+            throw new TransferException(ProtocolConstants.ERROR_RECEIVE_FOLDER_NOT_WRITABLE, "Receive folder cannot be created.");
+        }
         if (!Files.isWritable(receiveFolder)) {
-            throw new IOException(ProtocolConstants.ERROR_RECEIVE_FOLDER_NOT_CONFIGURED);
+            throw new TransferException(ProtocolConstants.ERROR_RECEIVE_FOLDER_NOT_WRITABLE, "Receive folder is not writable.");
         }
         return receiveFolder.toAbsolutePath().normalize();
+    }
+
+    private void ensureUsableSpace(Path receiveFolder, long expectedBytes) throws TransferException {
+        try {
+            FileStore fileStore = Files.getFileStore(receiveFolder);
+            if (fileStore.getUsableSpace() < expectedBytes) {
+                throw new TransferException(ProtocolConstants.ERROR_DISK_SPACE_LOW, "Not enough free disk space.");
+            }
+        } catch (IOException exception) {
+            if (exception instanceof TransferException transferException) {
+                throw transferException;
+            }
+            // FileStore probing is best-effort only.
+        }
     }
 
     private void receiveTransferLoop(
@@ -211,16 +378,17 @@ public class TransferServer {
         DataInputStream input,
         DataOutputStream output,
         Socket socket,
-        Path receiveFolder
+        Path receiveFolder,
+        String remoteAddress
     ) throws IOException {
         int receivedFiles = 0;
         long receivedBytes = 0;
 
         while (running) {
-            socket.setSoTimeout(ProtocolConstants.CONTROL_READ_TIMEOUT_MS);
+            socket.setSoTimeout(ProtocolConstants.HEADER_READ_TIMEOUT_MS);
             ProtocolMessage message = ProtocolMessage.read(input);
             if (ProtocolConstants.TYPE_SESSION_FINISH.equals(message.getType())) {
-                validateFinishMessage(session, message);
+                validateFinishMessage(session, message, receivedFiles, receivedBytes);
                 ProtocolMessage.write(output, ProtocolMessage.sessionFinishAck(
                     session.sessionId(),
                     localDeviceId,
@@ -231,26 +399,29 @@ public class TransferServer {
                 return;
             }
             if (!ProtocolConstants.TYPE_FILE_META.equals(message.getType())) {
-                throw new IOException("Unexpected protocol message " + message.getType());
+                throw new TransferException(ProtocolConstants.ERROR_MALFORMED_MESSAGE, "Unexpected protocol message " + message.getType());
             }
 
-            try {
-                validateFileMeta(session, message, receivedFiles, receivedBytes);
-            } catch (IOException exception) {
-                writeFileAck(output, session.sessionId(), message.getFileId(), false, errorCodeFor(exception));
-                throw exception;
-            }
-            socket.setSoTimeout(ProtocolConstants.PAYLOAD_READ_TIMEOUT_MS);
-            receiveSingleFile(session, message, input, output, receiveFolder);
+            validateFileMeta(session, message, receivedFiles, receivedBytes);
+            socket.setSoTimeout(ProtocolConstants.FILE_TRANSFER_IDLE_TIMEOUT_MS);
+            receiveSingleFile(session, message, input, output, receiveFolder, remoteAddress);
             receivedFiles++;
             receivedBytes += message.getSize();
         }
     }
 
-    private void validateFinishMessage(TransferSession session, ProtocolMessage message) throws IOException {
+    private void validateFinishMessage(
+        TransferSession session,
+        ProtocolMessage message,
+        int receivedFiles,
+        long receivedBytes
+    ) throws TransferException {
         if (!session.sessionId().equals(message.getSessionId())
             || !session.senderDeviceId().equals(message.getDeviceId())) {
-            throw new IOException("SESSION_FINISH has invalid identifiers.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_SESSION, "SESSION_FINISH has invalid identifiers.");
+        }
+        if (receivedFiles != session.totalFiles() || receivedBytes != session.totalSize()) {
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_SESSION, "SESSION_FINISH arrived before all declared files were received.");
         }
     }
 
@@ -259,21 +430,29 @@ public class TransferServer {
         ProtocolMessage fileMeta,
         int receivedFiles,
         long receivedBytes
-    ) throws IOException {
-        if (!session.sessionId().equals(fileMeta.getSessionId()) || isBlank(fileMeta.getFileId())) {
-            throw new IOException("Invalid FILE_META identifiers.");
+    ) throws TransferException {
+        if (!session.sessionId().equals(fileMeta.getSessionId())) {
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_SESSION, "FILE_META session id does not match the active session.");
+        }
+        if (isBlank(fileMeta.getFileId())) {
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_ID, "FILE_META file id is missing.");
         }
         if (!session.senderDeviceId().equals(fileMeta.getDeviceId())) {
-            throw new IOException("FILE_META came from a different device.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_SESSION, "FILE_META came from a different device.");
         }
         long size = fileMeta.getSize() == null ? -1 : fileMeta.getSize();
-        if (size < 0 || size > ProtocolConstants.MAX_FILE_SIZE_BYTES) {
-            throw new IOException("File size exceeds configured limits.");
+        if (size < 0) {
+            throw new TransferException(ProtocolConstants.ERROR_MALFORMED_MESSAGE, "FILE_META size is invalid.");
         }
-        if (receivedFiles + 1 > session.totalFiles()
-            || receivedBytes + size > ProtocolConstants.MAX_TOTAL_SESSION_BYTES
+        if (size > ProtocolConstants.MAX_FILE_SIZE_BYTES) {
+            throw new TransferException(ProtocolConstants.ERROR_FILE_TOO_LARGE, "File size exceeds the configured limit.");
+        }
+        if (receivedFiles + 1 > session.totalFiles()) {
+            throw new TransferException(ProtocolConstants.ERROR_TOO_MANY_FILES, "The sender exceeded the declared file count.");
+        }
+        if (receivedBytes + size > ProtocolConstants.MAX_TOTAL_SESSION_BYTES
             || receivedBytes + size > session.totalSize()) {
-            throw new IOException("Transfer session exceeds configured limits.");
+            throw new TransferException(ProtocolConstants.ERROR_TOTAL_TRANSFER_TOO_LARGE, "The sender exceeded the declared total size.");
         }
     }
 
@@ -282,57 +461,107 @@ public class TransferServer {
         ProtocolMessage fileMeta,
         DataInputStream input,
         DataOutputStream output,
-        Path receiveFolder
+        Path receiveFolder,
+        String remoteAddress
     ) throws IOException {
+        diagnosticsService.recordTransferEvent(
+            DiagnosticEventType.TRANSFER_FILE_STARTED,
+            DiagnosticDirection.IN,
+            remoteAddress,
+            session.senderDeviceId(),
+            session.senderDeviceName(),
+            null,
+            null,
+            null,
+            fileMeta.getRelativePath()
+        );
+
         Path relativePath;
         try {
             relativePath = FileUtils.sanitizeReceivedRelativePath(fileMeta.getRelativePath(), fileMeta.getFileName());
-        } catch (IOException exception) {
+        } catch (TransferException exception) {
             drainPayload(input, fileMeta.getSize());
-            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_INVALID_MESSAGE);
+            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, exception.getErrorCode(), exception.getMessage());
             throw exception;
         }
+
         Path targetPath = receiveFolder.resolve(relativePath).normalize();
         if (!targetPath.startsWith(receiveFolder)) {
             drainPayload(input, fileMeta.getSize());
-            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_INVALID_MESSAGE);
-            throw new IOException("Resolved target path leaves receive folder.");
+            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_INVALID_FILE_PATH, "Resolved target path leaves the receive folder.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Resolved target path leaves the receive folder.");
         }
 
         Path targetParent = targetPath.getParent() == null ? receiveFolder : targetPath.getParent();
         Files.createDirectories(targetParent);
+        ensureUsableSpace(receiveFolder, fileMeta.getSize());
         Path finalPath = FileNameResolver.resolve(targetPath).normalize();
         if (!finalPath.startsWith(receiveFolder)) {
             drainPayload(input, fileMeta.getSize());
-            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_INVALID_MESSAGE);
-            throw new IOException("Final target path leaves receive folder.");
+            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_INVALID_FILE_PATH, "Final target path leaves the receive folder.");
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Final target path leaves the receive folder.");
         }
 
         Path tempPath = finalPath.resolveSibling(finalPath.getFileName() + ".localdrop-part");
+        TransferException writeFailure = null;
         long remaining = fileMeta.getSize();
         try (var fileOutputStream = new BufferedOutputStream(Files.newOutputStream(tempPath))) {
             byte[] buffer = new byte[64 * 1024];
             while (remaining > 0) {
                 int chunkSize = (int) Math.min(buffer.length, remaining);
-                int read = input.read(buffer, 0, chunkSize);
-                if (read < 0) {
-                    throw new EOFException("Stream ended during file payload");
+                int read;
+                try {
+                    read = input.read(buffer, 0, chunkSize);
+                } catch (SocketTimeoutException exception) {
+                    Files.deleteIfExists(tempPath);
+                    writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_TRANSFER_TIMEOUT, "File transfer timed out.");
+                    throw new TransferException(ProtocolConstants.ERROR_TRANSFER_TIMEOUT, "File transfer timed out.");
                 }
-                fileOutputStream.write(buffer, 0, read);
+                if (read < 0) {
+                    Files.deleteIfExists(tempPath);
+                    throw new TransferException(ProtocolConstants.ERROR_CONNECTION_LOST, "Stream ended during file payload.");
+                }
+                if (writeFailure == null) {
+                    try {
+                        fileOutputStream.write(buffer, 0, read);
+                    } catch (IOException exception) {
+                        writeFailure = new TransferException(ProtocolConstants.ERROR_FILE_WRITE_ERROR, "Cannot write the received file.");
+                    }
+                }
                 remaining -= read;
             }
+        } catch (TransferException exception) {
+            Files.deleteIfExists(tempPath);
+            throw exception;
         } catch (IOException exception) {
             Files.deleteIfExists(tempPath);
-            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_INVALID_MESSAGE);
-            throw exception;
+            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_FILE_WRITE_ERROR, "Cannot write the received file.");
+            throw new TransferException(ProtocolConstants.ERROR_FILE_WRITE_ERROR, exception.getMessage());
+        }
+
+        if (writeFailure != null) {
+            Files.deleteIfExists(tempPath);
+            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, writeFailure.getErrorCode(), writeFailure.getMessage());
+            throw writeFailure;
         }
 
         FileUtils.moveAtomicallyOrReplace(tempPath, finalPath);
         if (fileMeta.getLastModified() != null) {
             FileUtils.applyLastModified(finalPath, fileMeta.getLastModified());
         }
-        writeFileAck(output, session.sessionId(), fileMeta.getFileId(), true, null);
+        writeFileAck(output, session.sessionId(), fileMeta.getFileId(), true, ProtocolConstants.ERROR_NONE, "OK");
 
+        diagnosticsService.recordTransferEvent(
+            DiagnosticEventType.TRANSFER_FILE_ACKED,
+            DiagnosticDirection.OUT,
+            remoteAddress,
+            session.senderDeviceId(),
+            session.senderDeviceName(),
+            null,
+            ProtocolConstants.STATUS_OK,
+            null,
+            fileMeta.getRelativePath()
+        );
         logger.info("Received file " + relativePath + " from " + session.senderDeviceName());
         listener.onReceiveCompleted(new RecentlyReceivedItem(relativePath.toString(), Files.size(finalPath), LocalTime.now()));
     }
@@ -355,7 +584,8 @@ public class TransferServer {
         String sessionId,
         String fileId,
         boolean ok,
-        String errorCode
+        String errorCode,
+        String errorMessage
     ) throws IOException {
         ProtocolMessage.write(output, ProtocolMessage.fileAck(
             sessionId,
@@ -364,24 +594,26 @@ public class TransferServer {
             localDeviceName,
             localDeviceType,
             ok,
-            errorCode,
-            errorCode
+            errorMessage,
+            ok ? null : errorCode
         ));
     }
 
-    private void writeSessionRejection(DataOutputStream output, String sessionId, String errorCode) throws IOException {
-        ProtocolMessage.write(output, ProtocolMessage.sessionRejected(sessionId, errorCode, errorCode));
+    private void writeSessionRejection(
+        DataOutputStream output,
+        String sessionId,
+        String errorCode,
+        String errorMessage
+    ) throws IOException {
+        ProtocolMessage.write(output, ProtocolMessage.sessionRejected(sessionId, errorMessage, errorCode));
     }
 
-    private String errorCodeFor(IOException exception) {
-        String message = exception.getMessage();
-        if (ProtocolConstants.ERROR_RECEIVE_FOLDER_NOT_CONFIGURED.equals(message)) {
-            return ProtocolConstants.ERROR_RECEIVE_FOLDER_NOT_CONFIGURED;
+    private void cleanupPartialFiles() {
+        try {
+            FileUtils.cleanupPartialFiles(receiveFolderSupplier.get(), ProtocolConstants.PART_FILE_CLEANUP_TTL_MS);
+        } catch (RuntimeException ignored) {
+            // Cleanup is best-effort only.
         }
-        if (message != null && message.toLowerCase().contains("limit")) {
-            return ProtocolConstants.ERROR_LIMIT_EXCEEDED;
-        }
-        return ProtocolConstants.ERROR_INVALID_MESSAGE;
     }
 
     private boolean isBlank(String value) {

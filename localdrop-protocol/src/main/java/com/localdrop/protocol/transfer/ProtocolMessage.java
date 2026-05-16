@@ -34,6 +34,8 @@ public class ProtocolMessage {
     private Integer totalFiles;
     private String reason;
     private String errorCode;
+    private String errorMessage;
+    private Boolean success;
     private Boolean checksumOk;
     private String savedAs;
 
@@ -76,6 +78,8 @@ public class ProtocolMessage {
         message.setSessionId(sessionId);
         message.setReason(reason);
         message.setErrorCode(errorCode);
+        message.setErrorMessage(reason);
+        message.setSuccess(false);
         return message;
     }
 
@@ -116,10 +120,12 @@ public class ProtocolMessage {
         message.setDeviceName(localDeviceName);
         message.setDeviceType(localDeviceType);
         message.setStatus(ok ? ProtocolConstants.STATUS_OK : ProtocolConstants.STATUS_ERROR);
+        message.setSuccess(ok);
         message.setChecksumOk(ok);
         if (!ok) {
             message.setReason(reason);
             message.setErrorCode(errorCode);
+            message.setErrorMessage(reason);
         }
         return message;
     }
@@ -349,6 +355,22 @@ public class ProtocolMessage {
         this.errorCode = errorCode;
     }
 
+    public String getErrorMessage() {
+        return errorMessage;
+    }
+
+    public void setErrorMessage(String errorMessage) {
+        this.errorMessage = errorMessage;
+    }
+
+    public Boolean getSuccess() {
+        return success;
+    }
+
+    public void setSuccess(Boolean success) {
+        this.success = success;
+    }
+
     public Boolean getChecksumOk() {
         return checksumOk;
     }
@@ -390,10 +412,11 @@ public class ProtocolMessage {
     }
 
     public String getMessage() {
-        return reason;
+        return errorMessage != null ? errorMessage : reason;
     }
 
     public void setMessage(String message) {
         this.reason = message;
+        this.errorMessage = message;
     }
 }

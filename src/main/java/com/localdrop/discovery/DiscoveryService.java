@@ -1,5 +1,8 @@
 package com.localdrop.discovery;
 
+import com.localdrop.diagnostics.DiagnosticDirection;
+import com.localdrop.diagnostics.DiagnosticEventType;
+import com.localdrop.diagnostics.DiagnosticsService;
 import com.localdrop.protocol.ProtocolConstants;
 import com.localdrop.protocol.ProtocolJson;
 import com.localdrop.protocol.discovery.DeviceInfo;
@@ -18,25 +21,35 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Enumeration;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-import java.util.logging.Level;
+import java.util.function.Supplier;
 import java.util.logging.Logger;
 
 public class DiscoveryService {
+    public record SendTargetResolution(DeviceInfo device, String errorCode, String message) {
+        public boolean canSend() {
+            return device != null && errorCode == null;
+        }
+    }
+
     private final Logger logger = LogService.getLogger(DiscoveryService.class);
     private final Map<String, DeviceInfo> devices = new ConcurrentHashMap<>();
     private final Map<String, Long> unicastResponses = new ConcurrentHashMap<>();
     private final ExecutorService listenerExecutor = Executors.newSingleThreadExecutor(r -> new Thread(r, "localdrop-discovery-listener"));
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2, r -> new Thread(r, "localdrop-discovery-scheduler"));
     private final Consumer<List<DeviceInfo>> devicesChangedCallback;
+    private final Supplier<String> localStatusSupplier;
+    private final DiagnosticsService diagnosticsService;
     private final String deviceId;
     private final String deviceName;
     private final String deviceType;
@@ -50,13 +63,17 @@ public class DiscoveryService {
         String deviceName,
         String deviceType,
         int tcpPort,
-        Consumer<List<DeviceInfo>> devicesChangedCallback
+        Supplier<String> localStatusSupplier,
+        Consumer<List<DeviceInfo>> devicesChangedCallback,
+        DiagnosticsService diagnosticsService
     ) {
         this.deviceId = deviceId;
         this.deviceName = deviceName;
         this.deviceType = deviceType;
         this.tcpPort = tcpPort;
+        this.localStatusSupplier = localStatusSupplier;
         this.devicesChangedCallback = devicesChangedCallback;
+        this.diagnosticsService = diagnosticsService;
     }
 
     public void start() throws IOException {
@@ -68,11 +85,25 @@ public class DiscoveryService {
         socket.setReuseAddress(true);
         socket.bind(new InetSocketAddress(ProtocolConstants.DISCOVERY_PORT));
         socket.setBroadcast(true);
-        socket.setSoTimeout(1500);
+        socket.setSoTimeout(1000);
 
         running = true;
+        diagnosticsService.refreshNetworkSnapshot();
+        diagnosticsService.setDiscoveryStatus("RUNNING", null);
+        diagnosticsService.recordTransferEvent(
+            DiagnosticEventType.DISCOVERY_STARTED,
+            DiagnosticDirection.INTERNAL,
+            null,
+            deviceId,
+            deviceName,
+            deviceType,
+            resolveLocalStatus(),
+            null,
+            "UDP discovery started."
+        );
+
         listenerExecutor.submit(this::listenLoop);
-        scheduler.scheduleAtFixedRate(this::safeBroadcast, 0, ProtocolConstants.DISCOVERY_BROADCAST_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        scheduler.scheduleAtFixedRate(this::safeBroadcast, 0, ProtocolConstants.DISCOVERY_BROADCAST_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
         scheduler.scheduleAtFixedRate(this::pruneExpiredDevices, 1, 1, TimeUnit.SECONDS);
 
         logger.info("UDP discovery v2-open started on port " + ProtocolConstants.DISCOVERY_PORT);
@@ -80,8 +111,8 @@ public class DiscoveryService {
 
     public void refreshNow() {
         scheduler.execute(this::pruneExpiredDevices);
-        for (int index = 0; index < 3; index++) {
-            scheduler.schedule(this::safeBroadcast, index * 250L, TimeUnit.MILLISECONDS);
+        for (int index = 0; index < ProtocolConstants.MANUAL_REFRESH_BURST_COUNT; index++) {
+            scheduler.schedule(this::safeBroadcast, index * ProtocolConstants.MANUAL_REFRESH_BURST_DELAY_MS, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -94,7 +125,57 @@ public class DiscoveryService {
         scheduler.shutdownNow();
         devices.clear();
         emitDevices();
+        diagnosticsService.setDiscoveryStatus("STOPPED", null);
+        diagnosticsService.recordTransferEvent(
+            DiagnosticEventType.DISCOVERY_STOPPED,
+            DiagnosticDirection.INTERNAL,
+            null,
+            deviceId,
+            deviceName,
+            deviceType,
+            null,
+            null,
+            "UDP discovery stopped."
+        );
         logger.info("UDP discovery stopped");
+    }
+
+    public SendTargetResolution resolveSendTarget(String remoteDeviceId) {
+        if (!running) {
+            return new SendTargetResolution(
+                null,
+                ProtocolConstants.DIAGNOSTIC_TRANSFER_CLIENT_NOT_STARTED,
+                "Device discovery is not running."
+            );
+        }
+
+        DeviceInfo device = devices.get(remoteDeviceId);
+        if (device == null) {
+            return new SendTargetResolution(
+                null,
+                ProtocolConstants.DIAGNOSTIC_DEVICE_NOT_FOUND,
+                "Device is not currently discovered on the local network."
+            );
+        }
+
+        long age = System.currentTimeMillis() - device.getLastSeenAt();
+        if (age > ProtocolConstants.DISCOVERY_DEVICE_TIMEOUT_MILLIS) {
+            return new SendTargetResolution(
+                null,
+                ProtocolConstants.DIAGNOSTIC_STALE_DEVICE_ADDRESS,
+                "The selected device is no longer live in discovery."
+            );
+        }
+
+        if (!isReceiveReady(device)) {
+            return new SendTargetResolution(
+                null,
+                ProtocolConstants.DIAGNOSTIC_DEVICE_NOT_READY,
+                "The selected device is visible but not ready to receive files."
+            );
+        }
+
+        return new SendTargetResolution(device, null, null);
     }
 
     private void listenLoop() {
@@ -105,33 +186,73 @@ public class DiscoveryService {
                 socket.receive(packet);
                 handlePacket(packet);
             } catch (SocketTimeoutException ignored) {
-                // Polling timeout is expected; periodic broadcasts may arrive later.
+                // Polling timeout is expected.
             } catch (SocketException exception) {
                 if (running) {
+                    diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
+                    diagnosticsService.recordDiscoveryError(
+                        ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR,
+                        exception.getMessage()
+                    );
                     logger.warning("Discovery socket error: " + exception.getMessage());
                 }
             } catch (IOException exception) {
                 if (running) {
+                    diagnosticsService.recordDiscoveryError(
+                        ProtocolConstants.DIAGNOSTIC_DISCOVERY_PACKET_MALFORMED,
+                        exception.getMessage()
+                    );
                     logger.warning("Failed to read discovery packet: " + exception.getMessage());
                 }
             } catch (RuntimeException exception) {
                 if (running) {
+                    diagnosticsService.recordDiscoveryError(
+                        ProtocolConstants.DIAGNOSTIC_DISCOVERY_PACKET_MALFORMED,
+                        exception.getMessage()
+                    );
                     logger.warning("Ignored malformed discovery packet: " + exception.getMessage());
                 }
             }
         }
+        diagnosticsService.recordTransferEvent(
+            DiagnosticEventType.DISCOVERY_STOPPED,
+            DiagnosticDirection.INTERNAL,
+            null,
+            deviceId,
+            deviceName,
+            deviceType,
+            null,
+            ProtocolConstants.DIAGNOSTIC_DISCOVERY_LISTENER_STOPPED,
+            "Discovery listener stopped."
+        );
     }
 
     private void handlePacket(DatagramPacket packet) throws IOException {
         if (packet.getLength() <= 0 || packet.getLength() > ProtocolConstants.DISCOVERY_PACKET_MAX_BYTES) {
-            logger.fine("Rejected discovery packet with invalid size: " + packet.getLength());
+            diagnosticsService.recordDiscoveryRejected(
+                packet.getAddress().getHostAddress(),
+                ProtocolConstants.DIAGNOSTIC_DISCOVERY_PACKET_REJECTED,
+                "Rejected discovery packet with invalid size: " + packet.getLength()
+            );
             return;
         }
 
         String json = new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8);
-        DiscoveryMessage message = ProtocolJson.fromJson(json, DiscoveryMessage.class);
-        if (!isValidDiscovery(message)) {
-            logger.fine("Rejected invalid discovery packet from " + packet.getAddress().getHostAddress());
+        DiscoveryMessage message;
+        try {
+            message = ProtocolJson.fromJson(json, DiscoveryMessage.class);
+        } catch (RuntimeException exception) {
+            diagnosticsService.recordDiscoveryRejected(
+                packet.getAddress().getHostAddress(),
+                ProtocolConstants.DIAGNOSTIC_DISCOVERY_PACKET_MALFORMED,
+                "Malformed discovery payload."
+            );
+            return;
+        }
+
+        String validationError = validateDiscovery(message);
+        if (validationError != null) {
+            diagnosticsService.recordDiscoveryRejected(packet.getAddress().getHostAddress(), validationError, "Discovery packet rejected.");
             return;
         }
         if (deviceId.equals(message.getDeviceId())) {
@@ -139,49 +260,67 @@ public class DiscoveryService {
         }
 
         long now = System.currentTimeMillis();
-        int remoteTcpPort = message.getTcpPort() == null ? ProtocolConstants.DEFAULT_TRANSFER_PORT : message.getTcpPort();
         DeviceInfo device = new DeviceInfo(
             message.getDeviceId(),
             message.getDeviceName(),
             message.getDeviceType(),
             message.getStatus(),
             packet.getAddress().getHostAddress(),
-            remoteTcpPort,
+            message.getTcpPort(),
             message.getCapabilities(),
             now
         );
 
         DeviceInfo previous = devices.put(device.getDeviceId(), device);
-        if (previous == null || hasPresentationChanged(previous, device)) {
-            logger.info("Discovered device " + device.getDeviceName()
-                + " at " + device.getHostAddress() + ":" + device.getTcpPort());
+        boolean added = previous == null;
+        boolean changed = added || hasPresentationChanged(previous, device);
+        diagnosticsService.recordDiscoveryReceived(device, packet.getAddress().getHostAddress());
+        diagnosticsService.upsertLiveDevice(device, added, changed);
+        if (changed) {
+            if (added) {
+                logger.info("Discovered device " + device.getDeviceName()
+                    + " at " + device.getHostAddress() + ":" + device.getTcpPort());
+            } else {
+                logger.info("Updated device " + device.getDeviceName()
+                    + " at " + device.getHostAddress() + ":" + device.getTcpPort()
+                    + " status=" + effectiveStatus(device));
+            }
             emitDevices();
-        } else if (logger.isLoggable(Level.FINE)) {
-            logger.fine("Refreshed discovery heartbeat for " + device.getDeviceName());
         }
 
         sendThrottledUnicastResponse(packet.getAddress());
     }
 
-    private boolean isValidDiscovery(DiscoveryMessage message) {
+    private String validateDiscovery(DiscoveryMessage message) {
         if (message == null || !ProtocolConstants.TYPE_DISCOVERY.equals(message.getType())) {
-            return false;
+            return ProtocolConstants.ERROR_MALFORMED_MESSAGE;
         }
         if (!Integer.valueOf(ProtocolConstants.PROTOCOL_VERSION).equals(message.getProtocolVersion())) {
-            return false;
+            return ProtocolConstants.ERROR_PROTOCOL_VERSION_MISMATCH;
         }
-        if (isBlank(message.getMessageId()) || isBlank(message.getDeviceId()) || isBlank(message.getDeviceName())) {
-            return false;
+        if (isBlank(message.getMessageId())
+            || isBlank(message.getDeviceId())
+            || isBlank(message.getDeviceName())
+            || isBlank(message.getDeviceType())) {
+            return ProtocolConstants.ERROR_MALFORMED_MESSAGE;
         }
-        if (message.getDeviceName().length() > ProtocolConstants.MAX_DEVICE_NAME_LENGTH) {
-            return false;
+        if (message.getDeviceId().length() > ProtocolConstants.MAX_DEVICE_ID_LENGTH
+            || message.getDeviceName().length() > ProtocolConstants.MAX_DEVICE_NAME_LENGTH
+            || message.getDeviceType().length() > ProtocolConstants.MAX_DEVICE_TYPE_LENGTH) {
+            return ProtocolConstants.ERROR_MALFORMED_MESSAGE;
+        }
+        if (message.getStatus() != null && message.getStatus().length() > ProtocolConstants.MAX_STATUS_LENGTH) {
+            return ProtocolConstants.ERROR_MALFORMED_MESSAGE;
         }
         if (!ProtocolConstants.DEVICE_TYPE_WINDOWS.equals(message.getDeviceType())
             && !ProtocolConstants.DEVICE_TYPE_ANDROID.equals(message.getDeviceType())) {
-            return false;
+            return ProtocolConstants.ERROR_MALFORMED_MESSAGE;
         }
         Integer port = message.getTcpPort();
-        return port != null && port > 0 && port <= 65_535;
+        if (port == null || port < 1 || port > 65_535) {
+            return ProtocolConstants.ERROR_TRANSFER_PORT_UNAVAILABLE;
+        }
+        return null;
     }
 
     private void sendThrottledUnicastResponse(InetAddress address) {
@@ -195,8 +334,12 @@ public class DiscoveryService {
 
         scheduler.execute(() -> {
             try {
-                sendDiscoveryTo(address);
+                sendDiscoveryTo(address, true);
             } catch (IOException exception) {
+                diagnosticsService.recordDiscoveryError(
+                    ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR,
+                    "Unable to send unicast discovery response: " + exception.getMessage()
+                );
                 logger.fine("Unable to send discovery unicast response to " + key + ": " + exception.getMessage());
             }
         });
@@ -207,6 +350,11 @@ public class DiscoveryService {
             broadcastOnce();
         } catch (IOException exception) {
             if (running) {
+                diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
+                diagnosticsService.recordDiscoveryError(
+                    ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR,
+                    exception.getMessage()
+                );
                 logger.warning("Failed to broadcast discovery: " + exception.getMessage());
             }
         }
@@ -217,20 +365,28 @@ public class DiscoveryService {
             return;
         }
 
-        sendDiscoveryTo(InetAddress.getByName("255.255.255.255"));
+        sendDiscoveryTo(InetAddress.getByName("255.255.255.255"), false);
         for (InetAddress broadcastAddress : resolveBroadcastAddresses()) {
-            sendDiscoveryTo(broadcastAddress);
+            sendDiscoveryTo(broadcastAddress, false);
         }
+        diagnosticsService.setDiscoveryStatus("RUNNING", null);
     }
 
-    private void sendDiscoveryTo(InetAddress address) throws IOException {
-        DiscoveryMessage message = DiscoveryMessage.create(deviceId, deviceName, deviceType, tcpPort);
+    private void sendDiscoveryTo(InetAddress address, boolean unicast) throws IOException {
+        DiscoveryMessage message = DiscoveryMessage.create(
+            deviceId,
+            deviceName,
+            deviceType,
+            resolveLocalStatus(),
+            tcpPort,
+            ProtocolConstants.CAPABILITIES
+        );
         byte[] payload = ProtocolJson.toJson(message).getBytes(StandardCharsets.UTF_8);
         if (payload.length > ProtocolConstants.DISCOVERY_PACKET_MAX_BYTES) {
             throw new IOException("Discovery packet is too large: " + payload.length);
         }
         sendPacket(payload, address);
-        logger.fine("Sent discovery packet to " + address.getHostAddress());
+        diagnosticsService.recordDiscoverySent(address.getHostAddress(), unicast);
     }
 
     private void sendPacket(byte[] payload, InetAddress address) throws IOException {
@@ -239,7 +395,7 @@ public class DiscoveryService {
     }
 
     private List<InetAddress> resolveBroadcastAddresses() throws SocketException {
-        List<InetAddress> addresses = new ArrayList<>();
+        Set<InetAddress> addresses = new LinkedHashSet<>();
         Enumeration<NetworkInterface> interfaces = NetworkInterface.getNetworkInterfaces();
         while (interfaces.hasMoreElements()) {
             NetworkInterface networkInterface = interfaces.nextElement();
@@ -251,17 +407,18 @@ public class DiscoveryService {
                 .filter(Objects::nonNull)
                 .forEach(addresses::add);
         }
-        return addresses;
+        return new ArrayList<>(addresses);
     }
 
     private void pruneExpiredDevices() {
-        long cutoff = System.currentTimeMillis() - ProtocolConstants.DISCOVERY_DEVICE_TIMEOUT_MILLIS;
+        long cutoff = System.currentTimeMillis() - ProtocolConstants.DISCOVERY_DEVICE_TIMEOUT_MILLIS - ProtocolConstants.MAIN_LIST_EXPIRE_GRACE_MS;
         List<DeviceInfo> removedDevices = devices.values().stream()
             .filter(device -> device.getLastSeenAt() < cutoff)
             .toList();
         boolean removed = devices.entrySet().removeIf(entry -> entry.getValue().getLastSeenAt() < cutoff);
         if (removed) {
             for (DeviceInfo device : removedDevices) {
+                diagnosticsService.markDeviceExpired(device);
                 logger.info("Device disappeared " + device.getDeviceName() + " at " + device.getHostAddress() + ":" + device.getTcpPort());
             }
             emitDevices();
@@ -273,6 +430,35 @@ public class DiscoveryService {
             .sorted(Comparator.comparing(DeviceInfo::getDeviceName, String.CASE_INSENSITIVE_ORDER))
             .toList();
         devicesChangedCallback.accept(snapshot);
+    }
+
+    private String resolveLocalStatus() {
+        try {
+            String status = localStatusSupplier == null ? null : localStatusSupplier.get();
+            return status == null || status.isBlank() ? ProtocolConstants.STATUS_READY : status;
+        } catch (RuntimeException exception) {
+            diagnosticsService.recordDiscoveryError(ProtocolConstants.ERROR_UNKNOWN, exception.getMessage());
+            return ProtocolConstants.STATUS_UNKNOWN;
+        }
+    }
+
+    private boolean isReceiveReady(DeviceInfo device) {
+        long age = System.currentTimeMillis() - device.getLastSeenAt();
+        return age <= ProtocolConstants.DISCOVERY_DEVICE_TIMEOUT_MILLIS
+            && isReceiveReadyStatus(device.getStatus());
+    }
+
+    private boolean isReceiveReadyStatus(String status) {
+        return status == null
+            || status.isBlank()
+            || ProtocolConstants.STATUS_READY.equalsIgnoreCase(status)
+            || ProtocolConstants.STATUS_READY_COMPAT.equalsIgnoreCase(status);
+    }
+
+    private String effectiveStatus(DeviceInfo device) {
+        return device.getStatus() == null || device.getStatus().isBlank()
+            ? ProtocolConstants.STATUS_READY_COMPAT
+            : device.getStatus();
     }
 
     private boolean hasPresentationChanged(DeviceInfo previous, DeviceInfo current) {
