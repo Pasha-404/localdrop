@@ -6,7 +6,7 @@ public class AppConfig {
     private String language;
     private String logLevel;
     private double windowWidth = 1400;
-    private double windowHeight = 800;
+    private double windowHeight = 640;
 
     public String getDeviceId() {
         return deviceId;

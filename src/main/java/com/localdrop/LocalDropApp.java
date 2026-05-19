@@ -44,7 +44,7 @@ public class LocalDropApp extends Application {
                 LocalDropApp.class.getResourceAsStream("/com/localdrop/icons/app.png")
             )));
             primaryStage.setMinWidth(1200);
-            primaryStage.setMinHeight(720);
+            primaryStage.setMinHeight(576);
             primaryStage.setScene(scene);
 
             Platform.setImplicitExit(false);

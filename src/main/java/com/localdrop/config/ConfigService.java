@@ -109,8 +109,8 @@ public class ConfigService {
         if (config.getWindowWidth() < 1200) {
             config.setWindowWidth(1400);
         }
-        if (config.getWindowHeight() < 720) {
-            config.setWindowHeight(800);
+        if (config.getWindowHeight() < 576) {
+            config.setWindowHeight(640);
         }
     }
 }

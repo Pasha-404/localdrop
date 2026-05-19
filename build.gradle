@@ -67,6 +67,7 @@ def jpackageInputDir = layout.buildDirectory.dir('jpackage/input')
 def jpackageRootDir = layout.buildDirectory.dir('jpackage')
 def appImageDir = layout.buildDirectory.dir("jpackage/${installerAppName}")
 def installerDir = layout.buildDirectory.dir('installer')
+def installerResourceDir = file('installer/windows/jpackage')
 def generatedWindowsIcon = layout.buildDirectory.file('jpackage/localdrop.ico')
 def externalRootIcoIcon = file('localdrop-icon.ico')
 
@@ -220,6 +221,7 @@ tasks.register('packageInstaller', Exec) {
     dependsOn 'packageAppImage', 'downloadWix'
     inputs.dir(appImageDir)
     inputs.file(generatedWindowsIcon)
+    inputs.dir(installerResourceDir)
     outputs.dir(installerDir)
 
     onlyIf { isWindows }
@@ -241,6 +243,7 @@ tasks.register('packageInstaller', Exec) {
         '--install-dir', installerAppName,
         '--app-image', appImageDir.get().asFile.absolutePath,
         '--icon', generatedWindowsIcon.get().asFile.absolutePath,
+        '--resource-dir', installerResourceDir.absolutePath,
         '--win-dir-chooser',
         '--win-shortcut',
         '--win-shortcut-prompt',
