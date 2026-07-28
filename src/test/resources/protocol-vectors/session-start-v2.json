@@ -1,0 +1,13 @@
+{
+  "type": "SESSION_START",
+  "protocolVersion": 2,
+  "messageId": "golden-message-001",
+  "sessionId": "golden-session-001",
+  "deviceId": "golden-device-windows",
+  "deviceName": "Golden Sender",
+  "deviceType": "WINDOWS",
+  "totalFiles": 1,
+  "totalSize": 4,
+  "capabilities": ["BATCH_TRANSFER_V1", "RELATIVE_PATHS", "OPEN_TRANSFER_V1"],
+  "timestamp": 1710000000000
+}

@@ -18,7 +18,10 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.logging.Logger;
 
@@ -69,7 +72,18 @@ public class TransferClient {
             return;
         }
 
-        long totalSize = items.stream().mapToLong(TransferQueueItem::getSize).sum();
+        Map<TransferQueueItem, SourceMetadata> sourceMetadata;
+        long totalSize;
+        try {
+            sourceMetadata = captureSourceMetadata(items);
+            totalSize = sourceMetadata.values().stream().mapToLong(SourceMetadata::size).sum();
+        } catch (TransferException exception) {
+            markRemaining(items, TransferStatus.FAILED, exception.getMessage(), listener);
+            listener.onTransferIssue(target.getDeviceName(), exception.getMessage());
+            recordEvent(DiagnosticEventType.TRANSFER_CLIENT_ERROR, target, exception.getErrorCode(), exception.getMessage());
+            listener.onTransferFinished();
+            return;
+        }
         if (items.size() > ProtocolConstants.MAX_FILES_PER_SESSION) {
             markRemaining(items, TransferStatus.FAILED, ProtocolConstants.ERROR_TOO_MANY_FILES, listener);
             listener.onTransferFinished();
@@ -124,6 +138,14 @@ public class TransferClient {
                     listener.onItemStatusChanged(currentItem, TransferStatus.SENDING, "");
                     listener.onItemProgress(currentItem, 0);
                     recordEvent(DiagnosticEventType.TRANSFER_FILE_STARTED, target, null, currentItem.getRelativePath());
+                    SourceMetadata declaredSource = sourceMetadata.get(currentItem);
+                    SourceMetadata currentSource = readSourceMetadata(currentItem.getSourcePath());
+                    if (declaredSource == null || currentSource.size() != declaredSource.size()) {
+                        throw new TransferException(
+                            ProtocolConstants.ERROR_FILE_READ_ERROR,
+                            "Source file changed after the transfer session was prepared."
+                        );
+                    }
 
                     ProtocolMessage.write(output, ProtocolMessage.fileMeta(
                         sessionId,
@@ -131,12 +153,12 @@ public class TransferClient {
                         senderDeviceId,
                         currentItem.getRelativePath(),
                         currentItem.getSourcePath().getFileName().toString(),
-                        currentItem.getSize(),
-                        currentItem.getLastModified()
+                        declaredSource.size(),
+                        currentSource.lastModified()
                     ));
 
                     phase = TransferPhase.FILE_PAYLOAD;
-                    streamFile(currentItem, output, listener);
+                    streamFile(currentItem, declaredSource.size(), output, listener);
 
                     phase = TransferPhase.FILE_ACK;
                     socket.setSoTimeout(ProtocolConstants.ACK_READ_TIMEOUT_MS);
@@ -178,21 +200,54 @@ public class TransferClient {
         }
     }
 
-    private void streamFile(TransferQueueItem item, DataOutputStream output, Listener listener) throws IOException {
-        long total = item.getSize();
+    private void streamFile(
+        TransferQueueItem item,
+        long declaredSize,
+        DataOutputStream output,
+        Listener listener
+    ) throws IOException, TransferException {
         long sent = 0;
         byte[] buffer = new byte[64 * 1024];
 
-        try (var inputStream = new BufferedInputStream(Files.newInputStream(item.getSourcePath()))) {
-            int read;
-            while ((read = inputStream.read(buffer)) != -1) {
-                output.write(buffer, 0, read);
-                sent += read;
-                listener.onItemProgress(item, total == 0 ? 1.0 : Math.min(1.0, (double) sent / total));
-            }
-            output.flush();
+        BufferedInputStream inputStream;
+        try {
+            inputStream = new BufferedInputStream(Files.newInputStream(item.getSourcePath()));
         } catch (IOException exception) {
             throw new TransferException(ProtocolConstants.ERROR_FILE_READ_ERROR, exception.getMessage());
+        }
+
+        try (inputStream) {
+            while (sent < declaredSize) {
+                int maxRead = (int) Math.min(buffer.length, declaredSize - sent);
+                int read;
+                try {
+                    read = inputStream.read(buffer, 0, maxRead);
+                } catch (IOException exception) {
+                    throw new TransferException(ProtocolConstants.ERROR_FILE_READ_ERROR, exception.getMessage());
+                }
+                if (read < 0) {
+                    throw new TransferException(
+                        ProtocolConstants.ERROR_FILE_READ_ERROR,
+                        "Source file ended before the declared payload size."
+                    );
+                }
+                output.write(buffer, 0, read);
+                sent += read;
+                listener.onItemProgress(item, declaredSize == 0 ? 1.0 : Math.min(1.0, (double) sent / declaredSize));
+            }
+            boolean sourceChanged;
+            try {
+                sourceChanged = inputStream.read() != -1 || Files.size(item.getSourcePath()) != declaredSize;
+            } catch (IOException exception) {
+                throw new TransferException(ProtocolConstants.ERROR_FILE_READ_ERROR, exception.getMessage());
+            }
+            if (sourceChanged) {
+                throw new TransferException(
+                    ProtocolConstants.ERROR_FILE_READ_ERROR,
+                    "Source file changed while it was being sent."
+                );
+            }
+            output.flush();
         }
     }
 
@@ -218,7 +273,7 @@ public class TransferClient {
         return expectedDeviceId == null || expectedDeviceId.equals(message.getDeviceId());
     }
 
-    private String validateFileAck(
+    static String validateFileAck(
         ProtocolMessage ack,
         String sessionId,
         String fileId,
@@ -235,6 +290,11 @@ public class TransferClient {
         }
         if (expectedDeviceId != null && !expectedDeviceId.equals(ack.getDeviceId())) {
             return ProtocolConstants.ERROR_ACK_MISMATCH;
+        }
+        if (Boolean.FALSE.equals(ack.getSuccess())
+            || Boolean.FALSE.equals(ack.getChecksumOk())
+            || ProtocolConstants.STATUS_ERROR.equalsIgnoreCase(ack.getStatus())) {
+            return resolveProtocolError(ack);
         }
         boolean success = Boolean.TRUE.equals(ack.getSuccess())
             || Boolean.TRUE.equals(ack.getChecksumOk())
@@ -275,7 +335,7 @@ public class TransferClient {
         logger.warning("Transfer session failed: " + message);
     }
 
-    private String resolveProtocolError(ProtocolMessage message) {
+    private static String resolveProtocolError(ProtocolMessage message) {
         if (message == null) {
             return ProtocolConstants.ERROR_UNKNOWN;
         }
@@ -305,6 +365,9 @@ public class TransferClient {
         if (exception instanceof EOFException) {
             return ProtocolConstants.ERROR_CONNECTION_LOST;
         }
+        if (phase == TransferPhase.FILE_PAYLOAD || phase == TransferPhase.FILE_ACK) {
+            return ProtocolConstants.ERROR_CONNECTION_LOST;
+        }
         return ProtocolConstants.ERROR_UNKNOWN;
     }
 
@@ -314,6 +377,38 @@ public class TransferClient {
             return exception.getMessage();
         }
         return errorCode;
+    }
+
+    private Map<TransferQueueItem, SourceMetadata> captureSourceMetadata(List<TransferQueueItem> items) throws TransferException {
+        Map<TransferQueueItem, SourceMetadata> metadata = new IdentityHashMap<>();
+        long total = 0;
+        for (TransferQueueItem item : items) {
+            SourceMetadata source = readSourceMetadata(item.getSourcePath());
+            if (source.size() > ProtocolConstants.MAX_FILE_SIZE_BYTES) {
+                throw new TransferException(ProtocolConstants.ERROR_FILE_TOO_LARGE, "Source file exceeds the per-file size limit.");
+            }
+            try {
+                total = Math.addExact(total, source.size());
+            } catch (ArithmeticException exception) {
+                throw new TransferException(ProtocolConstants.ERROR_TOTAL_TRANSFER_TOO_LARGE, "Source files exceed the total size limit.");
+            }
+            if (total > ProtocolConstants.MAX_TOTAL_SESSION_BYTES) {
+                throw new TransferException(ProtocolConstants.ERROR_TOTAL_TRANSFER_TOO_LARGE, "Source files exceed the total size limit.");
+            }
+            metadata.put(item, source);
+        }
+        return metadata;
+    }
+
+    private SourceMetadata readSourceMetadata(Path sourcePath) throws TransferException {
+        try {
+            if (!Files.isRegularFile(sourcePath)) {
+                throw new TransferException(ProtocolConstants.ERROR_FILE_READ_ERROR, "Source file is no longer available.");
+            }
+            return new SourceMetadata(Files.size(sourcePath), Files.getLastModifiedTime(sourcePath).toMillis());
+        } catch (IOException exception) {
+            throw new TransferException(ProtocolConstants.ERROR_FILE_READ_ERROR, exception.getMessage());
+        }
     }
 
     private void recordEvent(DiagnosticEventType eventType, DeviceInfo target, String errorCode, String message) {
@@ -331,5 +426,8 @@ public class TransferClient {
             errorCode,
             message
         );
+    }
+
+    private record SourceMetadata(long size, long lastModified) {
     }
 }

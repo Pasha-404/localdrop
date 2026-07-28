@@ -36,6 +36,7 @@ public class DiagnosticsService {
     private final String localDeviceType;
     private final Map<String, DiagnosticDeviceEntry> liveDevices = new LinkedHashMap<>();
     private final Map<String, DiagnosticDeviceEntry> recentExpiredDevices = new LinkedHashMap<>();
+    private final Map<String, BroadcastDestinationStatus> broadcastDestinations = new LinkedHashMap<>();
     private final Deque<DiagnosticEvent> eventBuffer = new ArrayDeque<>(ProtocolConstants.DIAGNOSTIC_EVENT_BUFFER_SIZE);
 
     private List<String> localIpAddresses = List.of();
@@ -43,12 +44,17 @@ public class DiagnosticsService {
     private int discoveryPort = ProtocolConstants.DISCOVERY_PORT;
     private int transferPort = ProtocolConstants.DEFAULT_TRANSFER_PORT;
     private String discoveryStatus = "STOPPED";
+    private boolean discoveryListenerBound;
     private String transferServerStatus = "STOPPED";
     private long lastDiscoverySentAt;
     private long lastDiscoveryReceivedAt;
     private String lastDiscoveryReceivedFrom = "";
     private String lastDiscoveryErrorCode = ProtocolConstants.ERROR_NONE;
+    private long lastDiscoveryErrorAt;
+    private long lastDiscoveryRecoveredAt;
     private String lastTransferErrorCode = ProtocolConstants.ERROR_NONE;
+    private long lastTransferErrorAt;
+    private long lastTransferRecoveredAt;
     private int mainListDevicesCount;
 
     public DiagnosticsService(String localDeviceId, String localDeviceName, String localDeviceType) {
@@ -95,8 +101,12 @@ public class DiagnosticsService {
     public void setDiscoveryStatus(String status, String errorCode) {
         synchronized (lock) {
             discoveryStatus = status;
+            discoveryListenerBound = "RUNNING".equals(status);
             if (errorCode != null && !errorCode.isBlank()) {
                 lastDiscoveryErrorCode = errorCode;
+                lastDiscoveryErrorAt = System.currentTimeMillis();
+            } else if ("RUNNING".equals(status) && lastDiscoveryErrorAt > 0) {
+                lastDiscoveryRecoveredAt = System.currentTimeMillis();
             }
         }
     }
@@ -106,6 +116,9 @@ public class DiagnosticsService {
             transferServerStatus = status;
             if (errorCode != null && !errorCode.isBlank()) {
                 lastTransferErrorCode = errorCode;
+                lastTransferErrorAt = System.currentTimeMillis();
+            } else if ("RUNNING".equals(status) && lastTransferErrorAt > 0) {
+                lastTransferRecoveredAt = System.currentTimeMillis();
             }
         }
     }
@@ -119,17 +132,31 @@ public class DiagnosticsService {
     public void recordDiscoverySent(String remoteAddress, boolean unicast) {
         synchronized (lock) {
             lastDiscoverySentAt = System.currentTimeMillis();
-            addEvent(new DiagnosticEvent(
-                lastDiscoverySentAt,
-                unicast ? DiagnosticEventType.DISCOVERY_SEND_UNICAST : DiagnosticEventType.DISCOVERY_SEND_BROADCAST,
-                DiagnosticDirection.OUT,
+            if (!unicast && remoteAddress != null && !remoteAddress.isBlank()) {
+                BroadcastDestinationStatus previous = broadcastDestinations.get(remoteAddress);
+                broadcastDestinations.put(remoteAddress, new BroadcastDestinationStatus(
+                    remoteAddress,
+                    lastDiscoverySentAt,
+                    previous == null ? 0 : previous.lastFailureAt(),
+                    previous == null ? null : previous.lastError(),
+                    (previous == null ? 0 : previous.successCount()) + 1,
+                    previous == null ? 0 : previous.failureCount()
+                ));
+            }
+        }
+    }
+
+    public void recordDiscoveryBroadcastFailure(String remoteAddress, String message) {
+        synchronized (lock) {
+            long now = System.currentTimeMillis();
+            BroadcastDestinationStatus previous = broadcastDestinations.get(remoteAddress);
+            broadcastDestinations.put(remoteAddress, new BroadcastDestinationStatus(
                 remoteAddress,
-                null,
-                null,
-                null,
-                null,
-                null,
-                unicast ? "Unicast discovery response sent." : "Broadcast discovery packet sent."
+                previous == null ? 0 : previous.lastSuccessAt(),
+                now,
+                message,
+                previous == null ? 0 : previous.successCount(),
+                (previous == null ? 0 : previous.failureCount()) + 1
             ));
         }
     }
@@ -138,18 +165,6 @@ public class DiagnosticsService {
         synchronized (lock) {
             lastDiscoveryReceivedAt = System.currentTimeMillis();
             lastDiscoveryReceivedFrom = remoteAddress;
-            addEvent(new DiagnosticEvent(
-                lastDiscoveryReceivedAt,
-                DiagnosticEventType.DISCOVERY_RECEIVED,
-                DiagnosticDirection.IN,
-                remoteAddress,
-                device.getDeviceId(),
-                device.getDeviceName(),
-                device.getDeviceType(),
-                effectiveStatus(device),
-                null,
-                "Discovery packet accepted."
-            ));
         }
     }
 
@@ -178,8 +193,9 @@ public class DiagnosticsService {
     public void recordDiscoveryError(String errorCode, String message) {
         synchronized (lock) {
             lastDiscoveryErrorCode = errorCode == null || errorCode.isBlank() ? ProtocolConstants.ERROR_UNKNOWN : errorCode;
+            lastDiscoveryErrorAt = System.currentTimeMillis();
             addEvent(new DiagnosticEvent(
-                System.currentTimeMillis(),
+                lastDiscoveryErrorAt,
                 DiagnosticEventType.DISCOVERY_ERROR,
                 DiagnosticDirection.INTERNAL,
                 null,
@@ -196,8 +212,9 @@ public class DiagnosticsService {
     public void recordTransferError(String errorCode, String message, String remoteAddress, String deviceId, String deviceName) {
         synchronized (lock) {
             lastTransferErrorCode = errorCode == null || errorCode.isBlank() ? ProtocolConstants.ERROR_UNKNOWN : errorCode;
+            lastTransferErrorAt = System.currentTimeMillis();
             addEvent(new DiagnosticEvent(
-                System.currentTimeMillis(),
+                lastTransferErrorAt,
                 DiagnosticEventType.TRANSFER_CLIENT_ERROR,
                 DiagnosticDirection.INTERNAL,
                 remoteAddress,
@@ -223,11 +240,16 @@ public class DiagnosticsService {
         String message
     ) {
         synchronized (lock) {
+            long now = System.currentTimeMillis();
             if (errorCode != null && !errorCode.isBlank()) {
                 lastTransferErrorCode = errorCode;
+                lastTransferErrorAt = now;
+            } else if (eventType == DiagnosticEventType.TRANSFER_FILE_ACKED
+                || eventType == DiagnosticEventType.TRANSFER_SERVER_STARTED) {
+                lastTransferRecoveredAt = now;
             }
             addEvent(new DiagnosticEvent(
-                System.currentTimeMillis(),
+                now,
                 eventType,
                 direction,
                 remoteAddress,
@@ -315,6 +337,8 @@ public class DiagnosticsService {
 
             return new DiagnosticSnapshot(
                 ProtocolConstants.CONTRACT_REVISION,
+                applicationVersion(),
+                System.getProperty("os.name", "Windows") + " " + System.getProperty("os.version", ""),
                 localDeviceId,
                 localDeviceName,
                 localDeviceType,
@@ -323,12 +347,20 @@ public class DiagnosticsService {
                 discoveryPort,
                 transferPort,
                 discoveryStatus,
+                discoveryListenerBound,
                 transferServerStatus,
                 lastDiscoverySentAt,
                 lastDiscoveryReceivedAt,
                 lastDiscoveryReceivedFrom,
                 lastDiscoveryErrorCode,
+                lastDiscoveryErrorAt,
+                lastDiscoveryRecoveredAt,
                 lastTransferErrorCode,
+                lastTransferErrorAt,
+                lastTransferRecoveredAt,
+                broadcastDestinations.values().stream()
+                    .sorted(Comparator.comparing(BroadcastDestinationStatus::address, String.CASE_INSENSITIVE_ORDER))
+                    .toList(),
                 liveDevices.size(),
                 mainListDevicesCount,
                 liveDevices.size() + recentExpiredDevices.size(),
@@ -345,6 +377,8 @@ public class DiagnosticsService {
         StringBuilder builder = new StringBuilder(4096);
         builder.append("LocalDrop Network Diagnostics").append(System.lineSeparator()).append(System.lineSeparator());
         builder.append("Contract revision: ").append(snapshot.contractRevision()).append(System.lineSeparator());
+        builder.append("Application version: ").append(snapshot.appVersion()).append(System.lineSeparator());
+        builder.append("OS version: ").append(snapshot.osVersion()).append(System.lineSeparator());
         builder.append("Local device: ")
             .append(snapshot.localDeviceName())
             .append(" [")
@@ -355,6 +389,7 @@ public class DiagnosticsService {
         builder.append("Local IP addresses: ").append(formatList(snapshot.localIpAddresses())).append(System.lineSeparator());
         builder.append("Active interfaces: ").append(formatList(snapshot.activeNetworkInterfaces())).append(System.lineSeparator());
         builder.append("UDP discovery: ").append(snapshot.discoveryStatus()).append(System.lineSeparator());
+        builder.append("UDP listener bound: ").append(snapshot.discoveryListenerBound()).append(System.lineSeparator());
         builder.append("TCP receive: ").append(snapshot.transferServerStatus()).append(System.lineSeparator());
         builder.append("Discovery port: ").append(snapshot.discoveryPort()).append(System.lineSeparator());
         builder.append("Transfer port: ").append(snapshot.transferPort()).append(System.lineSeparator());
@@ -362,10 +397,31 @@ public class DiagnosticsService {
         builder.append("Last discovery received: ").append(formatTimestamp(snapshot.lastDiscoveryReceivedAt())).append(System.lineSeparator());
         builder.append("Last discovery sender: ").append(blankToDash(snapshot.lastDiscoveryReceivedFrom())).append(System.lineSeparator());
         builder.append("Last discovery error: ").append(blankToDash(snapshot.lastDiscoveryErrorCode())).append(System.lineSeparator());
+        builder.append("Last discovery error at: ").append(formatTimestamp(snapshot.lastDiscoveryErrorAt())).append(System.lineSeparator());
+        builder.append("Last discovery recovered at: ").append(formatTimestamp(snapshot.lastDiscoveryRecoveredAt())).append(System.lineSeparator());
         builder.append("Last transfer error: ").append(blankToDash(snapshot.lastTransferErrorCode())).append(System.lineSeparator());
+        builder.append("Last transfer error at: ").append(formatTimestamp(snapshot.lastTransferErrorAt())).append(System.lineSeparator());
+        builder.append("Last transfer recovered at: ").append(formatTimestamp(snapshot.lastTransferRecoveredAt())).append(System.lineSeparator());
         builder.append("Live devices: ").append(snapshot.liveDevicesCount()).append(System.lineSeparator());
         builder.append("Main list devices: ").append(snapshot.mainListDevicesCount()).append(System.lineSeparator());
         builder.append("Diagnostics device entries: ").append(snapshot.diagnosticDevicesCount()).append(System.lineSeparator());
+        builder.append(System.lineSeparator());
+
+        builder.append("Broadcast destinations").append(System.lineSeparator());
+        if (snapshot.broadcastDestinations().isEmpty()) {
+            builder.append("- none").append(System.lineSeparator());
+        } else {
+            for (BroadcastDestinationStatus destination : snapshot.broadcastDestinations()) {
+                builder.append("- ")
+                    .append(destination.address())
+                    .append(" | success=").append(destination.successCount())
+                    .append(" | lastSuccess=").append(formatTimestamp(destination.lastSuccessAt()))
+                    .append(" | failure=").append(destination.failureCount())
+                    .append(" | lastFailure=").append(formatTimestamp(destination.lastFailureAt()))
+                    .append(" | error=").append(blankToDash(destination.lastError()))
+                    .append(System.lineSeparator());
+            }
+        }
         builder.append(System.lineSeparator());
 
         appendDeviceSection(builder, "Ready devices", snapshot.readyDevices());
@@ -514,5 +570,10 @@ public class DiagnosticsService {
 
     private static String blankToDash(String value) {
         return value == null || value.isBlank() ? "-" : value;
+    }
+
+    private static String applicationVersion() {
+        String implementationVersion = DiagnosticsService.class.getPackage().getImplementationVersion();
+        return implementationVersion == null || implementationVersion.isBlank() ? "2.2.0" : implementationVersion;
     }
 }

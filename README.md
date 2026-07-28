@@ -4,8 +4,9 @@ LocalDrop is a JavaFX-based Windows desktop app for local network file transfer 
 
 ## Project Structure
 
-- `localdrop` - Windows JavaFX desktop application
-- `localdrop-protocol` - shared LAN discovery and transfer contract module for future cross-platform clients
+- `src` - Windows JavaFX desktop application
+- `localdrop-protocol` - shared LAN discovery and transfer contract module used by the Windows app
+- `../android` - Android client when this repository is opened inside the combined LocalDrop workspace
 
 ## Requirements
 
@@ -64,13 +65,14 @@ gradlew.bat packageInstaller
 
 Installer output:
 
-- `build\installer\LocalDrop-2.0.0.exe`
+- `build\installer\LocalDrop-2.2.0.exe`
 
 Notes:
 
 - `packageInstaller` downloads portable WiX Toolset binaries into `build\tools\wix` automatically.
 - The installer icon is generated from the project PNG into a Windows `.ico` file during the build.
 - `jpackage` is included in JDK 21+, so the installer build must be run with a full JDK, not a JRE.
+- The installer includes a final-screen option to launch LocalDrop after installation.
 
 ## Notes
 
@@ -81,7 +83,7 @@ Notes:
 
 ## Limitations
 
-- Windows desktop app only. Android code lives in a separate project.
+- Windows desktop app only. Android code lives in the sibling `../android` client when using the combined workspace.
 - Protocol v2 is not wire-compatible with the old unsigned v1 flow.
 - File payload bytes and control messages are not encrypted or authenticated yet; use LocalDrop only on trusted local networks.
 - The transfer queue is stored in memory only and is lost after full exit.

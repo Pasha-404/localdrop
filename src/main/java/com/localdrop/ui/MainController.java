@@ -151,25 +151,25 @@ public class MainController {
             view.updateInlineError(i18n.format("errors.receiveService", exception.getMessage()));
         }
 
-        if (receiveAvailable) {
-            discoveryService = new DiscoveryService(
-                config.getDeviceId(),
-                deviceName,
-                ProtocolConstants.DEVICE_TYPE_WINDOWS,
-                transferServer.getBoundPort(),
-                this::resolveLocalDiscoveryStatus,
-                snapshot -> Platform.runLater(() -> applyDeviceSnapshot(snapshot))
-                ,
-                diagnosticsService
-            );
+        int advertisedTransferPort = receiveAvailable
+            ? transferServer.getBoundPort()
+            : ProtocolConstants.DEFAULT_TRANSFER_PORT;
+        discoveryService = new DiscoveryService(
+            config.getDeviceId(),
+            deviceName,
+            ProtocolConstants.DEVICE_TYPE_WINDOWS,
+            advertisedTransferPort,
+            this::resolveLocalDiscoveryStatus,
+            snapshot -> Platform.runLater(() -> applyDeviceSnapshot(snapshot)),
+            diagnosticsService
+        );
 
-            try {
-                discoveryService.start();
-            } catch (IOException exception) {
-                logger.severe("Unable to start device discovery: " + exception.getMessage());
-                diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
-                view.updateInlineError(i18n.format("errors.discoveryService", exception.getMessage()));
-            }
+        try {
+            discoveryService.start();
+        } catch (IOException exception) {
+            logger.severe("Unable to start device discovery: " + exception.getMessage());
+            diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
+            view.updateInlineError(i18n.format("errors.discoveryService", exception.getMessage()));
         }
     }
 

@@ -17,6 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 public class LocalDropApp extends Application {
+    private static volatile SingleInstanceService singleInstanceService;
     private final AtomicBoolean exitRequested = new AtomicBoolean(false);
     private final Logger logger = LogService.getLogger(LocalDropApp.class);
     private MainController controller;
@@ -50,6 +51,10 @@ public class LocalDropApp extends Application {
             Platform.setImplicitExit(false);
             configureTray(primaryStage);
             configureCloseBehavior(primaryStage);
+            SingleInstanceService instanceService = singleInstanceService;
+            if (instanceService != null) {
+                instanceService.setActivationHandler(() -> Platform.runLater(() -> activateStage(primaryStage)));
+            }
 
             primaryStage.show();
             controller.startServices();
@@ -67,6 +72,10 @@ public class LocalDropApp extends Application {
 
     static void launchApp(String[] args) {
         launch(args);
+    }
+
+    static void setSingleInstanceService(SingleInstanceService service) {
+        singleInstanceService = service;
     }
 
     private void configureTray(Stage stage) {
@@ -115,9 +124,22 @@ public class LocalDropApp extends Application {
             if (trayService != null) {
                 trayService.dispose();
             }
+            SingleInstanceService instanceService = singleInstanceService;
+            if (instanceService != null) {
+                instanceService.close();
+            }
             LogService.shutdown();
             Platform.exit();
         }
+    }
+
+    private void activateStage(Stage stage) {
+        if (!stage.isShowing()) {
+            stage.show();
+        }
+        stage.setIconified(false);
+        stage.toFront();
+        stage.requestFocus();
     }
 
 }

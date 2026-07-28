@@ -350,7 +350,6 @@ public class DiscoveryService {
             broadcastOnce();
         } catch (IOException exception) {
             if (running) {
-                diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
                 diagnosticsService.recordDiscoveryError(
                     ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR,
                     exception.getMessage()
@@ -365,11 +364,26 @@ public class DiscoveryService {
             return;
         }
 
-        sendDiscoveryTo(InetAddress.getByName("255.255.255.255"), false);
-        for (InetAddress broadcastAddress : resolveBroadcastAddresses()) {
-            sendDiscoveryTo(broadcastAddress, false);
+        Set<InetAddress> destinations = new LinkedHashSet<>();
+        destinations.add(InetAddress.getByName("255.255.255.255"));
+        destinations.addAll(resolveBroadcastAddresses());
+
+        boolean anySucceeded = false;
+        for (InetAddress destination : destinations) {
+            try {
+                sendDiscoveryTo(destination, false);
+                anySucceeded = true;
+            } catch (IOException exception) {
+                diagnosticsService.recordDiscoveryBroadcastFailure(destination.getHostAddress(), exception.getMessage());
+                logger.fine("Unable to broadcast discovery to " + destination.getHostAddress() + ": " + exception.getMessage());
+            }
         }
-        diagnosticsService.setDiscoveryStatus("RUNNING", null);
+        if (!anySucceeded && !destinations.isEmpty()) {
+            diagnosticsService.recordDiscoveryError(
+                ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR,
+                "No discovery broadcast destination accepted the packet."
+            );
+        }
     }
 
     private void sendDiscoveryTo(InetAddress address, boolean unicast) throws IOException {

@@ -477,29 +477,31 @@ public class TransferServer {
         );
 
         Path relativePath;
+        Path finalPath;
         try {
             relativePath = FileUtils.sanitizeReceivedRelativePath(fileMeta.getRelativePath(), fileMeta.getFileName());
+            Path targetPath = receiveFolder.resolve(relativePath).normalize();
+            if (!targetPath.startsWith(receiveFolder)) {
+                throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Resolved target path leaves the receive folder.");
+            }
+
+            Path targetParent = targetPath.getParent() == null ? receiveFolder : targetPath.getParent();
+            Files.createDirectories(targetParent);
+            ensureUsableSpace(receiveFolder, fileMeta.getSize());
+            finalPath = FileNameResolver.resolve(targetPath).normalize();
+            if (!finalPath.startsWith(receiveFolder)) {
+                throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Final target path leaves the receive folder.");
+            }
         } catch (TransferException exception) {
-            drainPayload(input, fileMeta.getSize());
-            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, exception.getErrorCode(), exception.getMessage());
+            rejectFileAfterDraining(input, output, session, fileMeta, exception);
             throw exception;
-        }
-
-        Path targetPath = receiveFolder.resolve(relativePath).normalize();
-        if (!targetPath.startsWith(receiveFolder)) {
-            drainPayload(input, fileMeta.getSize());
-            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_INVALID_FILE_PATH, "Resolved target path leaves the receive folder.");
-            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Resolved target path leaves the receive folder.");
-        }
-
-        Path targetParent = targetPath.getParent() == null ? receiveFolder : targetPath.getParent();
-        Files.createDirectories(targetParent);
-        ensureUsableSpace(receiveFolder, fileMeta.getSize());
-        Path finalPath = FileNameResolver.resolve(targetPath).normalize();
-        if (!finalPath.startsWith(receiveFolder)) {
-            drainPayload(input, fileMeta.getSize());
-            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_INVALID_FILE_PATH, "Final target path leaves the receive folder.");
-            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Final target path leaves the receive folder.");
+        } catch (IOException exception) {
+            TransferException failure = new TransferException(
+                ProtocolConstants.ERROR_FILE_WRITE_ERROR,
+                "Cannot prepare the receive target."
+            );
+            rejectFileAfterDraining(input, output, session, fileMeta, failure);
+            throw failure;
         }
 
         Path tempPath = finalPath.resolveSibling(finalPath.getFileName() + ".localdrop-part");
@@ -545,9 +547,25 @@ public class TransferServer {
             throw writeFailure;
         }
 
-        FileUtils.moveAtomicallyOrReplace(tempPath, finalPath);
-        if (fileMeta.getLastModified() != null) {
-            FileUtils.applyLastModified(finalPath, fileMeta.getLastModified());
+        long savedSize;
+        try {
+            FileUtils.moveAtomicallyOrReplace(tempPath, finalPath);
+            if (fileMeta.getLastModified() != null) {
+                FileUtils.applyLastModified(finalPath, fileMeta.getLastModified());
+            }
+            savedSize = Files.size(finalPath);
+        } catch (IOException exception) {
+            try {
+                Files.deleteIfExists(tempPath);
+            } catch (IOException ignored) {
+                // The structured ACK below remains more useful than a best-effort cleanup failure.
+            }
+            TransferException failure = new TransferException(
+                ProtocolConstants.ERROR_FILE_WRITE_ERROR,
+                "Cannot finalize the received file."
+            );
+            writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, failure.getErrorCode(), failure.getMessage());
+            throw failure;
         }
         writeFileAck(output, session.sessionId(), fileMeta.getFileId(), true, ProtocolConstants.ERROR_NONE, "OK");
 
@@ -563,7 +581,18 @@ public class TransferServer {
             fileMeta.getRelativePath()
         );
         logger.info("Received file " + relativePath + " from " + session.senderDeviceName());
-        listener.onReceiveCompleted(new RecentlyReceivedItem(relativePath.toString(), Files.size(finalPath), LocalTime.now()));
+        listener.onReceiveCompleted(new RecentlyReceivedItem(relativePath.toString(), savedSize, LocalTime.now()));
+    }
+
+    private void rejectFileAfterDraining(
+        DataInputStream input,
+        DataOutputStream output,
+        TransferSession session,
+        ProtocolMessage fileMeta,
+        TransferException failure
+    ) throws IOException {
+        drainPayload(input, fileMeta.getSize());
+        writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, failure.getErrorCode(), failure.getMessage());
     }
 
     private void drainPayload(DataInputStream input, Long size) throws IOException {

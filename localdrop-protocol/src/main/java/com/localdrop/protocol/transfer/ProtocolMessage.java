@@ -165,7 +165,11 @@ public class ProtocolMessage {
         if (headerBytes.length != headerLength) {
             throw new EOFException("Unexpected end of stream while reading protocol header");
         }
-        return ProtocolJson.mapper().readValue(headerBytes, ProtocolMessage.class);
+        ProtocolMessage message = ProtocolJson.mapper().readValue(headerBytes, ProtocolMessage.class);
+        if (message.getProtocolVersion() == null) {
+            throw new IOException("Protocol version is missing.");
+        }
+        return message;
     }
 
     public static void write(DataOutputStream outputStream, ProtocolMessage message) throws IOException {

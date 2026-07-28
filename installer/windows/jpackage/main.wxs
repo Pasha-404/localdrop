@@ -38,7 +38,7 @@
       Manufacturer="$(var.JpAppVendor)"
       InstallerVersion="$(var.JpInstallerVersion)"
       Compressed="$(var.JpCompressedMsi)"
-      InstallScope="$(var.JpInstallScope)" Platform="x64"
+      InstallScope="perMachine" Platform="x64"
     />
 
     <Media Id="1" Cabinet="Data.cab" EmbedCab="yes" />
@@ -80,7 +80,39 @@
       <ComponentGroupRef Id="Shortcuts"/>
       <ComponentGroupRef Id="Files"/>
       <ComponentGroupRef Id="FileAssociations"/>
+      <ComponentRef Id="LocalDropFirewallRules"/>
     </Feature>
+
+    <DirectoryRef Id="INSTALLDIR">
+      <Component Id="LocalDropFirewallRules" Guid="A6F542E3-5149-4A99-9B4F-2BD6BC3CD569">
+        <RegistryValue Root="HKLM" Key="Software\LocalDrop" Name="FirewallRulesInstalled" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <CustomAction Id="RemoveLocalDropFirewallRulesBeforeInstall"
+                  Directory="TARGETDIR"
+                  ExeCommand="cmd.exe /d /c &quot;netsh.exe advfirewall firewall delete rule name=&quot;&quot;LocalDrop UDP Discovery Private&quot;&quot; &amp; netsh.exe advfirewall firewall delete rule name=&quot;&quot;LocalDrop UDP Discovery Domain&quot;&quot; &amp; netsh.exe advfirewall firewall delete rule name=&quot;&quot;LocalDrop TCP Transfer Private&quot;&quot; &amp; netsh.exe advfirewall firewall delete rule name=&quot;&quot;LocalDrop TCP Transfer Domain&quot;&quot;&quot;"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+    <CustomAction Id="AddLocalDropUdpPrivateRule"
+                  Directory="TARGETDIR"
+                  ExeCommand="netsh.exe advfirewall firewall add rule name=&quot;LocalDrop UDP Discovery Private&quot; dir=in action=allow protocol=UDP localport=45454 profile=private remoteip=localsubnet"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="AddLocalDropUdpDomainRule"
+                  Directory="TARGETDIR"
+                  ExeCommand="netsh.exe advfirewall firewall add rule name=&quot;LocalDrop UDP Discovery Domain&quot; dir=in action=allow protocol=UDP localport=45454 profile=domain remoteip=localsubnet"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="AddLocalDropTcpPrivateRule"
+                  Directory="TARGETDIR"
+                  ExeCommand="netsh.exe advfirewall firewall add rule name=&quot;LocalDrop TCP Transfer Private&quot; dir=in action=allow protocol=TCP localport=45455-45474 profile=private remoteip=localsubnet"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="AddLocalDropTcpDomainRule"
+                  Directory="TARGETDIR"
+                  ExeCommand="netsh.exe advfirewall firewall add rule name=&quot;LocalDrop TCP Transfer Domain&quot; dir=in action=allow protocol=TCP localport=45455-45474 profile=domain remoteip=localsubnet"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="RemoveLocalDropFirewallRulesOnUninstall"
+                  Directory="TARGETDIR"
+                  ExeCommand="cmd.exe /d /c &quot;netsh.exe advfirewall firewall delete rule name=&quot;&quot;LocalDrop UDP Discovery Private&quot;&quot; &amp; netsh.exe advfirewall firewall delete rule name=&quot;&quot;LocalDrop UDP Discovery Domain&quot;&quot; &amp; netsh.exe advfirewall firewall delete rule name=&quot;&quot;LocalDrop TCP Transfer Private&quot;&quot; &amp; netsh.exe advfirewall firewall delete rule name=&quot;&quot;LocalDrop TCP Transfer Domain&quot;&quot;&quot;"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
 
     <CustomAction Id="JpSetARPINSTALLLOCATION" Property="ARPINSTALLLOCATION" Value="[INSTALLDIR]" />
     <CustomAction Id="JpSetARPCOMMENTS" Property="ARPCOMMENTS" Value="$(var.JpAppDescription)" />
@@ -116,6 +148,12 @@
       <Custom Action="JpSetARPCOMMENTS" After="CostFinalize">Not Installed</Custom>
       <Custom Action="JpSetARPCONTACT" After="CostFinalize">Not Installed</Custom>
       <Custom Action="JpSetARPSIZE" After="CostFinalize">Not Installed</Custom>
+      <Custom Action="RemoveLocalDropFirewallRulesBeforeInstall" After="InstallFiles">NOT Installed</Custom>
+      <Custom Action="AddLocalDropUdpPrivateRule" After="RemoveLocalDropFirewallRulesBeforeInstall">NOT Installed</Custom>
+      <Custom Action="AddLocalDropUdpDomainRule" After="AddLocalDropUdpPrivateRule">NOT Installed</Custom>
+      <Custom Action="AddLocalDropTcpPrivateRule" After="AddLocalDropUdpDomainRule">NOT Installed</Custom>
+      <Custom Action="AddLocalDropTcpDomainRule" After="AddLocalDropTcpPrivateRule">NOT Installed</Custom>
+      <Custom Action="RemoveLocalDropFirewallRulesOnUninstall" Before="RemoveFiles">REMOVE=&quot;ALL&quot;</Custom>
       <?ifdef JpHelpURL ?>
         <Custom Action="JpSetARPHELPLINK" After="CostFinalize">Not Installed</Custom>
       <?endif?>
