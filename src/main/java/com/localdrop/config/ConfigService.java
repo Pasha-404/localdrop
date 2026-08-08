@@ -106,10 +106,10 @@ public class ConfigService {
         if (config.getLogLevel() == null || config.getLogLevel().isBlank()) {
             config.setLogLevel("INFO");
         }
-        if (config.getWindowWidth() < 1200) {
+        if (!Double.isFinite(config.getWindowWidth()) || config.getWindowWidth() <= 0) {
             config.setWindowWidth(1400);
         }
-        if (config.getWindowHeight() < 576) {
+        if (!Double.isFinite(config.getWindowHeight()) || config.getWindowHeight() <= 0) {
             config.setWindowHeight(640);
         }
     }

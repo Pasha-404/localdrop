@@ -93,8 +93,10 @@ public final class Dialogs {
         root.setBottom(buttons);
         BorderPane.setMargin(buttons, new Insets(12, 0, 0, 0));
 
-        javafx.scene.Scene scene = new javafx.scene.Scene(root, 980, 720);
+        WindowLayout.FittedBounds dialogBounds = WindowLayout.fitToPrimaryScreen(980, 720, 640, 420);
+        javafx.scene.Scene scene = new javafx.scene.Scene(root, dialogBounds.width(), dialogBounds.height());
         stage.setScene(scene);
+        WindowLayout.apply(stage, dialogBounds);
         stage.show();
     }
 }

@@ -37,6 +37,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
@@ -62,14 +63,16 @@ public class MainController {
         return thread;
     });
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
+    private final AtomicBoolean serviceStartupScheduled = new AtomicBoolean(false);
+    private final Object serviceLifecycleLock = new Object();
     private final I18n i18n;
     private final MainView view = new MainView(devices, queueItems, recentItems);
     private final TransferClient transferClient;
     private final Map<String, Long> busyVisibilitySince = new HashMap<>();
 
     private Stage stage;
-    private TransferServer transferServer;
-    private DiscoveryService discoveryService;
+    private volatile TransferServer transferServer;
+    private volatile DiscoveryService discoveryService;
     private List<DeviceInfo> latestDiscoverySnapshot = List.of();
     private volatile boolean transferInProgress;
     private ReceiveActivity receiveActivity = ReceiveActivity.READY;
@@ -99,8 +102,25 @@ public class MainController {
         updateReceiveActivityLabel();
     }
 
-    public void startServices() throws IOException {
-        transferServer = new TransferServer(
+    /** Starts local network listeners without delaying the JavaFX application thread. */
+    public void startServicesAsync() {
+        if (shutdown.get() || !serviceStartupScheduled.compareAndSet(false, true)) {
+            return;
+        }
+
+        try {
+            backgroundExecutor.submit(this::startServices);
+        } catch (RejectedExecutionException ignored) {
+            // Shutdown won the race before the background task was accepted.
+        }
+    }
+
+    private void startServices() {
+        if (shutdown.get()) {
+            return;
+        }
+
+        TransferServer candidateTransferServer = new TransferServer(
             configService::getReceiveFolder,
             config.getDeviceId(),
             deviceName,
@@ -141,20 +161,30 @@ public class MainController {
 
         boolean receiveAvailable = false;
         try {
-            transferServer.start();
+            candidateTransferServer.start();
             receiveAvailable = true;
-            setReceiveActivity(ReceiveActivity.READY, null);
+            if (!registerTransferServer(candidateTransferServer)) {
+                candidateTransferServer.stop();
+                return;
+            }
+            runOnUiThread(() -> setReceiveActivity(ReceiveActivity.READY, null));
         } catch (IOException exception) {
             logger.severe("Unable to start receive service: " + exception.getMessage());
             diagnosticsService.setTransferServerStatus("ERROR", ProtocolConstants.ERROR_TRANSFER_PORT_UNAVAILABLE);
-            setReceiveActivity(ReceiveActivity.UNAVAILABLE, null);
-            view.updateInlineError(i18n.format("errors.receiveService", exception.getMessage()));
+            runOnUiThread(() -> {
+                setReceiveActivity(ReceiveActivity.UNAVAILABLE, null);
+                view.updateInlineError(i18n.format("errors.receiveService", exception.getMessage()));
+            });
+        }
+
+        if (shutdown.get()) {
+            return;
         }
 
         int advertisedTransferPort = receiveAvailable
-            ? transferServer.getBoundPort()
+            ? candidateTransferServer.getBoundPort()
             : ProtocolConstants.DEFAULT_TRANSFER_PORT;
-        discoveryService = new DiscoveryService(
+        DiscoveryService candidateDiscoveryService = new DiscoveryService(
             config.getDeviceId(),
             deviceName,
             ProtocolConstants.DEVICE_TYPE_WINDOWS,
@@ -165,12 +195,43 @@ public class MainController {
         );
 
         try {
-            discoveryService.start();
+            candidateDiscoveryService.start();
+            if (!registerDiscoveryService(candidateDiscoveryService)) {
+                candidateDiscoveryService.stop();
+            }
         } catch (IOException exception) {
             logger.severe("Unable to start device discovery: " + exception.getMessage());
             diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
-            view.updateInlineError(i18n.format("errors.discoveryService", exception.getMessage()));
+            runOnUiThread(() -> view.updateInlineError(i18n.format("errors.discoveryService", exception.getMessage())));
         }
+    }
+
+    private boolean registerTransferServer(TransferServer candidate) {
+        synchronized (serviceLifecycleLock) {
+            if (shutdown.get()) {
+                return false;
+            }
+            transferServer = candidate;
+            return true;
+        }
+    }
+
+    private boolean registerDiscoveryService(DiscoveryService candidate) {
+        synchronized (serviceLifecycleLock) {
+            if (shutdown.get()) {
+                return false;
+            }
+            discoveryService = candidate;
+            return true;
+        }
+    }
+
+    private void runOnUiThread(Runnable action) {
+        Platform.runLater(() -> {
+            if (!shutdown.get()) {
+                action.run();
+            }
+        });
     }
 
     public void shutdown() {
@@ -186,11 +247,19 @@ public class MainController {
             logger.warning("Failed to persist window size: " + exception.getMessage());
         }
 
-        if (discoveryService != null) {
-            discoveryService.stop();
+        DiscoveryService discoveryServiceToStop;
+        TransferServer transferServerToStop;
+        synchronized (serviceLifecycleLock) {
+            discoveryServiceToStop = discoveryService;
+            discoveryService = null;
+            transferServerToStop = transferServer;
+            transferServer = null;
         }
-        if (transferServer != null) {
-            transferServer.stop();
+        if (discoveryServiceToStop != null) {
+            discoveryServiceToStop.stop();
+        }
+        if (transferServerToStop != null) {
+            transferServerToStop.stop();
         }
         backgroundExecutor.shutdownNow();
     }

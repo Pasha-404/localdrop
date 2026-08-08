@@ -574,6 +574,6 @@ public class DiagnosticsService {
 
     private static String applicationVersion() {
         String implementationVersion = DiagnosticsService.class.getPackage().getImplementationVersion();
-        return implementationVersion == null || implementationVersion.isBlank() ? "2.2.0" : implementationVersion;
+        return implementationVersion == null || implementationVersion.isBlank() ? "2.2.1" : implementationVersion;
     }
 }

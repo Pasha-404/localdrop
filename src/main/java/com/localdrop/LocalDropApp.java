@@ -4,6 +4,7 @@ import com.localdrop.config.AppConfig;
 import com.localdrop.config.ConfigService;
 import com.localdrop.ui.MainController;
 import com.localdrop.ui.TrayService;
+import com.localdrop.ui.WindowLayout;
 import com.localdrop.util.BootstrapDiagnostics;
 import com.localdrop.util.LogService;
 import javafx.application.Application;
@@ -35,7 +36,13 @@ public class LocalDropApp extends Application {
             controller = new MainController(configService, config, ConfigService.resolveDeviceName());
             controller.attachStage(primaryStage);
 
-            Scene scene = new Scene(controller.getRoot(), config.getWindowWidth(), config.getWindowHeight());
+            WindowLayout.FittedBounds initialWindowBounds = WindowLayout.fitToPrimaryScreen(
+                config.getWindowWidth(),
+                config.getWindowHeight(),
+                960,
+                480
+            );
+            Scene scene = new Scene(controller.getRoot(), initialWindowBounds.width(), initialWindowBounds.height());
             scene.getStylesheets().add(Objects.requireNonNull(
                 LocalDropApp.class.getResource("/com/localdrop/styles.css")
             ).toExternalForm());
@@ -44,9 +51,8 @@ public class LocalDropApp extends Application {
             primaryStage.getIcons().add(new Image(Objects.requireNonNull(
                 LocalDropApp.class.getResourceAsStream("/com/localdrop/icons/app.png")
             )));
-            primaryStage.setMinWidth(1200);
-            primaryStage.setMinHeight(576);
             primaryStage.setScene(scene);
+            WindowLayout.apply(primaryStage, initialWindowBounds);
 
             Platform.setImplicitExit(false);
             configureTray(primaryStage);
@@ -57,8 +63,8 @@ public class LocalDropApp extends Application {
             }
 
             primaryStage.show();
-            controller.startServices();
-            logger.info("Application started");
+            controller.startServicesAsync();
+            logger.info("Application window shown; background services starting");
         } catch (Throwable throwable) {
             BootstrapDiagnostics.reportFailure("LocalDrop startup error", throwable);
             requestExit();
