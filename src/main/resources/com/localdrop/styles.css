@@ -6,6 +6,17 @@
     -fx-background-color: linear-gradient(to bottom, #f5f8fd, #eef3f9);
 }
 
+.content-scroll,
+.content-scroll > .viewport,
+.content-scroll > .corner {
+    -fx-background-color: transparent;
+}
+
+.content-scroll {
+    -fx-background-insets: 0;
+    -fx-padding: 0;
+}
+
 .header {
     -fx-background-color: rgba(255, 255, 255, 0.8);
 }

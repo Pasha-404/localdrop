@@ -55,6 +55,7 @@ public class ConfigService {
     public void updateWindowSize(double width, double height) throws IOException {
         getConfig().setWindowWidth(width);
         getConfig().setWindowHeight(height);
+        getConfig().setWindowSizeConfigured(true);
         save();
     }
 
@@ -110,7 +111,11 @@ public class ConfigService {
             config.setWindowWidth(1400);
         }
         if (!Double.isFinite(config.getWindowHeight()) || config.getWindowHeight() <= 0) {
-            config.setWindowHeight(640);
+            config.setWindowHeight(800);
+        }
+        if (!config.isWindowSizeConfigured() && config.getWindowHeight() == 640) {
+            // Older configurations cannot distinguish the previous first-run default from a manual 640 px choice.
+            config.setWindowHeight(800);
         }
     }
 }

@@ -6,7 +6,8 @@ public class AppConfig {
     private String language;
     private String logLevel;
     private double windowWidth = 1400;
-    private double windowHeight = 640;
+    private double windowHeight = 800;
+    private boolean windowSizeConfigured;
 
     public String getDeviceId() {
         return deviceId;
@@ -54,5 +55,13 @@ public class AppConfig {
 
     public void setWindowHeight(double windowHeight) {
         this.windowHeight = windowHeight;
+    }
+
+    public boolean isWindowSizeConfigured() {
+        return windowSizeConfigured;
+    }
+
+    public void setWindowSizeConfigured(boolean windowSizeConfigured) {
+        this.windowSizeConfigured = windowSizeConfigured;
     }
 }

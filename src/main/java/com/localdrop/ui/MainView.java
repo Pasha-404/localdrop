@@ -19,6 +19,7 @@ import javafx.scene.control.Label;
 import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
 import javafx.scene.control.ProgressBar;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
 import javafx.scene.layout.BorderPane;
@@ -305,7 +306,14 @@ public class MainView {
         centerColumn.setMaxWidth(Double.MAX_VALUE);
 
         content.getChildren().addAll(leftColumn, centerColumn, rightColumn);
-        return content;
+
+        ScrollPane contentScroll = new ScrollPane(content);
+        contentScroll.getStyleClass().add("content-scroll");
+        contentScroll.setFitToWidth(true);
+        contentScroll.setFitToHeight(true);
+        contentScroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.AS_NEEDED);
+        contentScroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.AS_NEEDED);
+        return contentScroll;
     }
 
     private VBox buildDevicesColumn() {
