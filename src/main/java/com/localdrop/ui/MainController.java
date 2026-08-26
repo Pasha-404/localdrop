@@ -10,6 +10,7 @@ import com.localdrop.protocol.ProtocolConstants;
 import com.localdrop.protocol.discovery.DeviceInfo;
 import com.localdrop.transfer.RecentlyReceivedItem;
 import com.localdrop.transfer.TransferClient;
+import com.localdrop.transfer.ProgressUpdateThrottle;
 import com.localdrop.transfer.TransferQueueItem;
 import com.localdrop.transfer.TransferServer;
 import com.localdrop.transfer.TransferStatus;
@@ -424,8 +425,13 @@ public class MainController {
             ProtocolConstants.DEVICE_TYPE_WINDOWS,
             pendingItems,
             new TransferClient.Listener() {
+                private final ProgressUpdateThrottle progressThrottle = new ProgressUpdateThrottle();
+
                 @Override
                 public void onItemStatusChanged(TransferQueueItem item, TransferStatus status, String message) {
+                    if (status == TransferStatus.SENDING) {
+                        progressThrottle.reset();
+                    }
                     Platform.runLater(() -> {
                         item.setStatus(status);
                         item.setMessage(message == null ? "" : message);
@@ -438,6 +444,9 @@ public class MainController {
 
                 @Override
                 public void onItemProgress(TransferQueueItem item, double progress) {
+                    if (!progressThrottle.shouldPublish(progress)) {
+                        return;
+                    }
                     Platform.runLater(() -> {
                         item.setStatus(TransferStatus.SENDING);
                         item.setMessage("");

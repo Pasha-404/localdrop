@@ -23,6 +23,7 @@ public class LocalDropApp extends Application {
     private final Logger logger = LogService.getLogger(LocalDropApp.class);
     private MainController controller;
     private TrayService trayService;
+    private boolean movingToTray;
 
     @Override
     public void start(Stage primaryStage) throws Exception {
@@ -59,7 +60,7 @@ public class LocalDropApp extends Application {
             configureCloseBehavior(primaryStage);
             SingleInstanceService instanceService = singleInstanceService;
             if (instanceService != null) {
-                instanceService.setActivationHandler(() -> Platform.runLater(() -> activateStage(primaryStage)));
+                instanceService.setActivationHandler(() -> Platform.runLater(() -> restoreStage(primaryStage)));
             }
 
             primaryStage.show();
@@ -87,14 +88,7 @@ public class LocalDropApp extends Application {
     private void configureTray(Stage stage) {
         trayService = new TrayService();
         trayService.install(
-            () -> Platform.runLater(() -> {
-                if (!stage.isShowing()) {
-                    stage.show();
-                }
-                stage.setIconified(false);
-                stage.toFront();
-                stage.requestFocus();
-            }),
+            () -> Platform.runLater(() -> restoreStage(stage)),
             this::requestExit
         );
     }
@@ -110,8 +104,17 @@ public class LocalDropApp extends Application {
         stage.iconifiedProperty().addListener((obs, oldValue, newValue) -> {
             if (Boolean.TRUE.equals(newValue) && trayService != null && trayService.isInstalled() && !exitRequested.get()) {
                 Platform.runLater(() -> {
-                    stage.hide();
-                    stage.setIconified(false);
+                    if (stage.isIconified() && !exitRequested.get() && !movingToTray) {
+                        movingToTray = true;
+                        try {
+                            // A hidden iconified Stage cannot be reliably restored on some Windows 11 systems.
+                            stage.setIconified(false);
+                            stage.hide();
+                            logger.info("Main window moved to tray");
+                        } finally {
+                            movingToTray = false;
+                        }
+                    }
                 });
             }
         });
@@ -139,13 +142,19 @@ public class LocalDropApp extends Application {
         }
     }
 
-    private void activateStage(Stage stage) {
+    private void restoreStage(Stage stage) {
+        if (exitRequested.get()) {
+            return;
+        }
+
+        // Windows 11 can keep a hidden iconified Stage invisible if show() runs first.
+        stage.setIconified(false);
         if (!stage.isShowing()) {
             stage.show();
         }
-        stage.setIconified(false);
         stage.toFront();
         stage.requestFocus();
+        logger.info("Main window restored from tray");
     }
 
 }
