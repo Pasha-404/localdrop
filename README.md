@@ -8,11 +8,13 @@ LocalDrop is a JavaFX-based Windows desktop app for local network file transfer 
 - `localdrop-protocol` - shared LAN discovery and transfer contract module used by the Windows app
 - `../android` - Android client when this repository is opened inside the combined LocalDrop workspace
 
-## Requirements
+## Development Requirements
 
 - Windows 10/11
-- Java 21 or newer
+- JDK 21 or newer
 - Network access within the same LAN
+
+Installed LocalDrop does not require Java: the app image includes its own Java runtime.
 
 ## Build
 
@@ -42,37 +44,48 @@ Windows:
 gradlew.bat run
 ```
 
-## Build Windows Installer
+## Build Windows Release
 
-The project includes Gradle tasks that create a self-contained Windows installer with:
+The Windows release is a self-contained, per-user Inno Setup installer with:
 
 - install directory chooser
-- optional desktop shortcut prompt
+- optional desktop shortcut
 - Start Menu entry
 - bundled Java runtime
+- AppFleet manifest and SHA-256 checksum
 
-Build the app image:
-
-```bat
-gradlew.bat packageAppImage
-```
-
-Build the final Windows installer:
+Install Inno Setup 6 once on the build machine:
 
 ```bat
-gradlew.bat packageInstaller
+choco install innosetup -y
 ```
 
-Installer output:
+Then build and verify the complete release set:
 
-- `build\installer\LocalDrop-2.2.2.exe`
+```bat
+gradlew.bat clean buildWindowsInstaller --no-daemon
+```
+
+Release output:
+
+- `dist\release\<version>\LocalDrop-Setup-<version>-x64.exe`
+- `dist\release\<version>\LocalDrop-Setup-<version>-x64.exe.sha256`
+- `dist\release\<version>\appfleet-manifest.json`
 
 Notes:
 
-- `packageInstaller` downloads portable WiX Toolset binaries into `build\tools\wix` automatically.
-- The installer icon is generated from the project PNG into a Windows `.ico` file during the build.
-- `jpackage` is included in JDK 21+, so the installer build must be run with a full JDK, not a JRE.
-- The installer includes a final-screen option to launch LocalDrop after installation.
+- The project version in `build.gradle` is the single source for the application, installer, manifest, and release tag version. A GitHub tag must be named `v<version>`.
+- `jpackage` creates the app image; Inno Setup 6 creates the final EXE. The current `.ico` is used for both.
+- The installer defaults to `%LOCALAPPDATA%\Programs\PashaApps\LocalDrop`, never needs permanent administrator rights, and offers a final-screen option to launch LocalDrop.
+- Existing WiX/MSI installations are detected only through the known LocalDrop MSI UpgradeCode. The installer asks before removing that legacy version and does not delete user data.
+- `packageInstaller` remains as an alias for `buildWindowsInstaller` for local compatibility.
+
+## Application Data
+
+- Configuration: `%APPDATA%\PashaApps\LocalDrop\config.json`
+- Logs: `%LOCALAPPDATA%\PashaApps\LocalDrop\logs`
+
+On first start after upgrading from a pre-2.3.0 version, LocalDrop copies the old configuration from `%LOCALAPPDATA%\LocalDrop\config.json` only if no new configuration exists. The old file is retained.
 
 ## Notes
 

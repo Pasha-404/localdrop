@@ -26,28 +26,17 @@ jobs:
           java-version: '21'
           cache: gradle
 
-      - name: Build application
-        run: .\gradlew.bat build
+      - name: Install Inno Setup 6
+        run: choco install innosetup --yes --no-progress
 
-      - name: Build Windows installer
-        run: .\gradlew.bat packageInstaller
+      - name: Build and verify Windows release artifacts
+        run: .\gradlew.bat buildWindowsInstaller --no-daemon
 
-      - name: Locate installer
-        id: installer
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem -Path "build/installer/*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (-not $installer) {
-            throw "Installer not found in build/installer"
-          }
-          "path=$($installer.FullName)" >> $env:GITHUB_OUTPUT
-          "name=$($installer.Name)" >> $env:GITHUB_OUTPUT
-
-      - name: Upload installer artifact
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: localdrop-windows-installer-${{ github.ref_name }}
-          path: ${{ steps.installer.outputs.path }}
+          name: localdrop-windows-release-${{ github.ref_name }}
+          path: dist/release/*
           if-no-files-found: error
           retention-days: 14
 
@@ -57,12 +46,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
-          INSTALLER_PATH: ${{ steps.installer.outputs.path }}
+          RELEASE_DIRECTORY: dist/release
         run: |
+          $assets = Get-ChildItem -Path $env:RELEASE_DIRECTORY -Recurse -File
+          if ($assets.Count -ne 3) {
+            throw "Expected exactly three release artifacts, found $($assets.Count)"
+          }
           gh release view $env:TAG_NAME *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $env:TAG_NAME $env:INSTALLER_PATH --title $env:TAG_NAME --generate-notes
+            gh release create $env:TAG_NAME $assets.FullName --title $env:TAG_NAME --generate-notes
           }
           else {
-            gh release upload $env:TAG_NAME $env:INSTALLER_PATH --clobber
+            gh release upload $env:TAG_NAME $assets.FullName --clobber
           }

@@ -20,6 +20,14 @@ public class ConfigService {
 
     public AppConfig load() throws IOException {
         Files.createDirectories(AppPaths.appDirectory());
+        try {
+            if (AppPaths.migrateLegacyConfigIfNeeded()) {
+                logger.info("Migrated configuration from the legacy LocalDrop data directory.");
+            }
+        } catch (IOException exception) {
+            logger.warning("Failed to migrate legacy configuration: " + exception.getMessage());
+        }
+
         if (Files.exists(configFile)) {
             try {
                 config = JsonUtils.read(configFile, AppConfig.class);

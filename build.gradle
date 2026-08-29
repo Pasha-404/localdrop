@@ -1,7 +1,11 @@
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
 import java.awt.Graphics2D
 import java.awt.RenderingHints
 import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 import java.util.Locale
 import javax.imageio.ImageIO
 
@@ -11,7 +15,7 @@ plugins {
 }
 
 group = 'com.localdrop'
-version = '2.2.2'
+version = '2.3.0'
 
 repositories {
     mavenCentral()
@@ -49,6 +53,13 @@ tasks.named('test') {
     useJUnitPlatform()
 }
 
+tasks.named('processResources') {
+    inputs.property('appVersion', project.version.toString())
+    filesMatching('com/localdrop/i18n/messages_*.properties') {
+        filter { String line -> line.replace('@APP_VERSION@', project.version.toString()) }
+    }
+}
+
 jar {
     manifest {
         attributes 'Main-Class': application.mainClass.get()
@@ -59,17 +70,24 @@ def isWindows = System.getProperty('os.name').toLowerCase(Locale.ROOT).contains(
 def installerAppName = 'LocalDrop'
 def installerVersion = project.version.toString()
 def installerDescription = 'Local network file transfer'
-def winUpgradeUuid = '6af7e2f8-87f9-4f90-9f34-4553c379785c'
-def wixDownloadUrl = 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip'
-def wixZipFile = layout.buildDirectory.file('tools/wix314-binaries.zip')
-def wixHomeDir = layout.buildDirectory.dir('tools/wix')
+def publisher = 'PashaApps'
+def repositoryUrl = 'https://github.com/Pasha-404/localdrop'
+def appId = 'a96d2beb-644f-4461-aaea-cc00c58c3917'
+def legacyMsiUpgradeCode = '6af7e2f8-87f9-4f90-9f34-4553c379785c'
+def installerAssetName = "${installerAppName}-Setup-${installerVersion}-x64.exe"
+def installerSha256Name = "${installerAssetName}.sha256"
+
 def jpackageInputDir = layout.buildDirectory.dir('jpackage/input')
 def jpackageRootDir = layout.buildDirectory.dir('jpackage')
 def appImageDir = layout.buildDirectory.dir("jpackage/${installerAppName}")
-def installerDir = layout.buildDirectory.dir('installer')
-def installerResourceDir = file('installer/windows/jpackage')
 def generatedWindowsIcon = layout.buildDirectory.file('jpackage/localdrop.ico')
 def externalRootIcoIcon = file('localdrop-icon.ico')
+def innoScript = file('installer/windows/inno/LocalDrop.iss')
+def innoOutputDir = layout.buildDirectory.dir('inno')
+def installerFile = layout.buildDirectory.file("inno/${installerAssetName}")
+def appFleetManifestFile = layout.buildDirectory.file('release/appfleet-manifest.json')
+def sha256File = layout.buildDirectory.file("release/${installerSha256Name}")
+def releaseDirectory = file("dist/release/${installerVersion}")
 
 def resolveJpackageExecutable = {
     def javaHome = System.getenv('JAVA_HOME') ?: System.getProperty('java.home')
@@ -81,8 +99,30 @@ def resolveJpackageExecutable = {
     executable.absolutePath
 }
 
+def resolveInnoSetupCompiler = {
+    List<File> candidates = []
+    String explicitCompiler = System.getenv('ISCC_PATH')
+    if (explicitCompiler != null && !explicitCompiler.isBlank()) {
+        candidates.add(file(explicitCompiler))
+    }
+
+    String innoSetupHome = System.getenv('INNO_SETUP_HOME')
+    if (innoSetupHome != null && !innoSetupHome.isBlank()) {
+        candidates.add(new File(innoSetupHome, 'ISCC.exe'))
+    }
+
+    candidates.add(file('C:/Program Files (x86)/Inno Setup 6/ISCC.exe'))
+    candidates.add(file('C:/Program Files/Inno Setup 6/ISCC.exe'))
+
+    File compiler = candidates.find { it.isFile() }
+    if (compiler == null) {
+        throw new GradleException('Inno Setup 6 compiler was not found. Install it with "choco install innosetup -y" or set ISCC_PATH to ISCC.exe.')
+    }
+    compiler.absolutePath
+}
+
 tasks.register('generateWindowsInstallerIcon') {
-    description = 'Generates a Windows ICO file for jpackage from the app PNG icon.'
+    description = 'Generates a Windows ICO file for the app image and Inno Setup installer.'
     group = 'distribution'
     inputs.files('src/main/resources/com/localdrop/icons/app.png', 'localdrop-icon.ico')
     outputs.file(generatedWindowsIcon)
@@ -133,7 +173,6 @@ tasks.register('generateWindowsInstallerIcon') {
             writeWord(0)
             writeWord(1)
             writeWord(1)
-
             output.write(0)
             output.write(0)
             output.write(0)
@@ -143,36 +182,6 @@ tasks.register('generateWindowsInstallerIcon') {
             writeDword(pngBytes.length)
             writeDword(22)
             output.write(pngBytes)
-        }
-    }
-}
-
-tasks.register('downloadWix') {
-    description = 'Downloads portable WiX Toolset binaries locally for jpackage Windows installer builds.'
-    group = 'distribution'
-    outputs.dir(wixHomeDir)
-
-    doLast {
-        File wixDir = wixHomeDir.get().asFile
-        File candleExe = new File(wixDir, 'candle.exe')
-        if (candleExe.exists()) {
-            return
-        }
-
-        wixDir.mkdirs()
-        File archive = wixZipFile.get().asFile
-        archive.parentFile.mkdirs()
-
-        if (!archive.exists()) {
-            logger.lifecycle("Downloading WiX Toolset from ${wixDownloadUrl}")
-            new URL(wixDownloadUrl).withInputStream { input ->
-                archive.withOutputStream { output -> output << input }
-            }
-        }
-
-        copy {
-            from zipTree(archive)
-            into wixDir
         }
     }
 }
@@ -192,7 +201,6 @@ tasks.register('packageAppImage', Exec) {
     inputs.dir(jpackageInputDir)
     inputs.file(generatedWindowsIcon)
     outputs.dir(appImageDir)
-
     onlyIf { isWindows }
 
     doFirst {
@@ -206,7 +214,7 @@ tasks.register('packageAppImage', Exec) {
         '--dest', jpackageRootDir.get().asFile.absolutePath,
         '--name', installerAppName,
         '--app-version', installerVersion,
-        '--vendor', installerAppName,
+        '--vendor', publisher,
         '--description', installerDescription,
         '--input', jpackageInputDir.get().asFile.absolutePath,
         '--main-jar', "${project.name}-${project.version}.jar",
@@ -215,40 +223,154 @@ tasks.register('packageAppImage', Exec) {
     )
 }
 
-tasks.register('packageInstaller', Exec) {
-    description = 'Builds a Windows EXE installer for LocalDrop with folder selection and shortcut prompt.'
+tasks.register('compileInnoInstaller', Exec) {
+    description = 'Builds the LocalDrop per-user Windows installer with Inno Setup.'
     group = 'distribution'
-    dependsOn 'packageAppImage', 'downloadWix'
+    dependsOn 'packageAppImage'
     inputs.dir(appImageDir)
     inputs.file(generatedWindowsIcon)
-    inputs.dir(installerResourceDir)
-    outputs.dir(installerDir)
-
+    inputs.file(innoScript)
+    inputs.properties([appId: appId, appVersion: installerVersion, legacyMsiUpgradeCode: legacyMsiUpgradeCode])
+    outputs.file(installerFile)
     onlyIf { isWindows }
 
     doFirst {
-        delete(installerDir)
-        installerDir.get().asFile.mkdirs()
+        innoOutputDir.get().asFile.mkdirs()
+        commandLine(
+            resolveInnoSetupCompiler(),
+            "/DAppVersion=${installerVersion}",
+            "/DAppImageDir=${appImageDir.get().asFile.absolutePath}",
+            "/DOutputDir=${innoOutputDir.get().asFile.absolutePath}",
+            "/DAppId=${appId}",
+            "/DIconFile=${generatedWindowsIcon.get().asFile.absolutePath}",
+            "/DLegacyMsiUpgradeCode={${legacyMsiUpgradeCode}}",
+            innoScript.absolutePath
+        )
     }
+}
 
-    environment 'PATH', wixHomeDir.get().asFile.absolutePath + File.pathSeparator + System.getenv('PATH')
-    commandLine(
-        resolveJpackageExecutable(),
-        '--type', 'exe',
-        '--dest', installerDir.get().asFile.absolutePath,
-        '--name', installerAppName,
-        '--app-version', installerVersion,
-        '--vendor', installerAppName,
-        '--description', installerDescription,
-        '--install-dir', installerAppName,
-        '--app-image', appImageDir.get().asFile.absolutePath,
-        '--icon', generatedWindowsIcon.get().asFile.absolutePath,
-        '--resource-dir', installerResourceDir.absolutePath,
-        '--win-dir-chooser',
-        '--win-shortcut',
-        '--win-shortcut-prompt',
-        '--win-menu',
-        '--win-menu-group', installerAppName,
-        '--win-upgrade-uuid', winUpgradeUuid
-    )
+tasks.register('generateAppFleetManifest') {
+    description = 'Generates the AppFleet metadata manifest for the Windows installer.'
+    group = 'distribution'
+    inputs.properties([appId: appId, appVersion: installerVersion, installerAssetName: installerAssetName, installerSha256Name: installerSha256Name])
+    outputs.file(appFleetManifestFile)
+
+    doLast {
+        File manifest = appFleetManifestFile.get().asFile
+        manifest.parentFile.mkdirs()
+        Map content = [
+            schemaVersion: 1,
+            appId: appId,
+            name: installerAppName,
+            technicalName: installerAppName,
+            version: installerVersion,
+            repositoryUrl: repositoryUrl,
+            platform: 'windows',
+            architecture: 'x64',
+            installer: [
+                type: 'inno',
+                assetName: installerAssetName,
+                sha256AssetName: installerSha256Name,
+                silentArgs: ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS']
+            ],
+            detection: [
+                registryKey: "HKCU\\Software\\${publisher}\\${appId}",
+                versionValue: 'Version',
+                executableValue: 'Executable'
+            ],
+            processNames: ['LocalDrop.exe'],
+            minimumAppFleetVersion: '1.0.0'
+        ]
+        manifest.setText(JsonOutput.prettyPrint(JsonOutput.toJson(content)) + System.lineSeparator(), StandardCharsets.UTF_8.name())
+    }
+}
+
+def installerSha256 = { File source ->
+    MessageDigest digest = MessageDigest.getInstance('SHA-256')
+    source.withInputStream { input ->
+        byte[] buffer = new byte[8192]
+        int read
+        while ((read = input.read(buffer)) != -1) {
+            digest.update(buffer, 0, read)
+        }
+    }
+    digest.digest().collect { String.format('%02x', it & 0xff) }.join()
+}
+
+tasks.register('writeInstallerSha256') {
+    description = 'Writes the SHA-256 checksum for the Windows installer.'
+    group = 'distribution'
+    dependsOn 'compileInnoInstaller'
+    inputs.file(installerFile)
+    outputs.file(sha256File)
+
+    doLast {
+        File checksum = sha256File.get().asFile
+        checksum.parentFile.mkdirs()
+        checksum.setText("${installerSha256(installerFile.get().asFile)}  ${installerAssetName}${System.lineSeparator()}", StandardCharsets.UTF_8.name())
+    }
+}
+
+tasks.register('assembleReleaseArtifacts', Sync) {
+    description = 'Places the standard LocalDrop release artifacts in dist/release/<version>.'
+    group = 'distribution'
+    dependsOn 'compileInnoInstaller', 'generateAppFleetManifest', 'writeInstallerSha256'
+    from(installerFile, sha256File, appFleetManifestFile)
+    into(releaseDirectory)
+}
+
+tasks.register('verifyReleaseVersion') {
+    description = 'Ensures a GitHub tag version matches the Gradle application version.'
+    group = 'verification'
+
+    doLast {
+        String refType = System.getenv('GITHUB_REF_TYPE')
+        String refName = System.getenv('GITHUB_REF_NAME')
+        if ('tag'.equalsIgnoreCase(refType) && refName != null && !refName.isBlank()) {
+            String expectedTag = "v${installerVersion}"
+            if (refName != expectedTag) {
+                throw new GradleException("GitHub tag ${refName} does not match application version ${installerVersion}; expected ${expectedTag}.")
+            }
+        }
+    }
+}
+
+tasks.register('verifyReleaseArtifacts') {
+    description = 'Validates the installer, checksum, and AppFleet manifest as one release set.'
+    group = 'verification'
+    dependsOn 'assembleReleaseArtifacts'
+
+    doLast {
+        Set<String> expectedFiles = [installerAssetName, installerSha256Name, 'appfleet-manifest.json'] as Set
+        Set<String> actualFiles = releaseDirectory.listFiles()?.findAll { it.isFile() }?.collect { it.name }?.toSet() ?: [] as Set
+        if (actualFiles != expectedFiles) {
+            throw new GradleException("Unexpected release artifact set in ${releaseDirectory}: ${actualFiles}")
+        }
+
+        Map manifestData = new JsonSlurper().parse(new File(releaseDirectory, 'appfleet-manifest.json')) as Map
+        if (manifestData.appId != appId || manifestData.version != installerVersion ||
+            manifestData.installer.assetName != installerAssetName ||
+            manifestData.installer.sha256AssetName != installerSha256Name) {
+            throw new GradleException('AppFleet manifest does not match the current application version and installer metadata.')
+        }
+
+        File installer = new File(releaseDirectory, installerAssetName)
+        String actualHash = installerSha256(installer)
+        String expectedHash = new File(releaseDirectory, installerSha256Name).getText(StandardCharsets.UTF_8.name()).trim().split(/\s+/)[0]
+        if (actualHash != expectedHash) {
+            throw new GradleException('Installer SHA-256 file does not match the generated installer.')
+        }
+    }
+}
+
+tasks.register('buildWindowsInstaller') {
+    description = 'Builds and verifies the standard LocalDrop Windows release artifact set.'
+    group = 'distribution'
+    dependsOn 'test', 'verifyReleaseVersion', 'verifyReleaseArtifacts'
+}
+
+tasks.register('packageInstaller') {
+    description = 'Compatibility alias for buildWindowsInstaller.'
+    group = 'distribution'
+    dependsOn 'buildWindowsInstaller'
 }
