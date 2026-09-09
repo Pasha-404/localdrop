@@ -74,7 +74,7 @@ Release output:
 
 Notes:
 
-- The project version in `build.gradle` is the single source for the application, installer, manifest, and release tag version. A GitHub tag must be named `v<version>`.
+- The project version in `gradle.properties` is the single source for the application, installer, manifest, and release tag version. A GitHub tag must be named `v<version>`.
 - `jpackage` creates the app image; Inno Setup 6 creates the final EXE. The current `.ico` is used for both.
 - The installer defaults to `%LOCALAPPDATA%\Programs\PashaApps\LocalDrop`, never needs permanent administrator rights, and offers a final-screen option to launch LocalDrop.
 - Existing WiX/MSI installations are detected only through the known LocalDrop MSI UpgradeCode. The installer asks before removing that legacy version and does not delete user data.

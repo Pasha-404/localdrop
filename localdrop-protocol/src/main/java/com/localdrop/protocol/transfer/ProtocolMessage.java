@@ -73,9 +73,19 @@ public class ProtocolMessage {
         return message;
     }
 
-    public static ProtocolMessage sessionRejected(String sessionId, String reason, String errorCode) {
+    public static ProtocolMessage sessionRejected(
+        String sessionId,
+        String localDeviceId,
+        String localDeviceName,
+        String localDeviceType,
+        String reason,
+        String errorCode
+    ) {
         ProtocolMessage message = base(ProtocolConstants.TYPE_SESSION_REJECTED);
         message.setSessionId(sessionId);
+        message.setDeviceId(localDeviceId);
+        message.setDeviceName(localDeviceName);
+        message.setDeviceType(localDeviceType);
         message.setReason(reason);
         message.setErrorCode(errorCode);
         message.setErrorMessage(reason);

@@ -10,6 +10,21 @@
 #ifndef AppId
   #error "AppId must be supplied by Gradle."
 #endif
+#ifndef AppName
+  #error "AppName must be supplied by Gradle."
+#endif
+#ifndef TechnicalName
+  #error "TechnicalName must be supplied by Gradle."
+#endif
+#ifndef MainExecutable
+  #error "MainExecutable must be supplied by Gradle."
+#endif
+#ifndef Publisher
+  #error "Publisher must be supplied by Gradle."
+#endif
+#ifndef RepositoryUrl
+  #error "RepositoryUrl must be supplied by Gradle."
+#endif
 #ifndef IconFile
   #error "IconFile must be supplied by Gradle."
 #endif
@@ -17,20 +32,18 @@
   #error "LegacyMsiUpgradeCode must be supplied by Gradle."
 #endif
 
-#define AppName "LocalDrop"
-#define Publisher "PashaApps"
-#define RepositoryUrl "https://github.com/Pasha-404/localdrop"
-#define InstallerAssetName AppName + "-Setup-" + AppVersion + "-x64"
+#define InstallerAssetName TechnicalName + "-Setup-" + AppVersion + "-x64"
 
 [Setup]
 AppId={#AppId}
 AppName={#AppName}
 AppVersion={#AppVersion}
+UninstallDisplayName={#AppName}
 AppPublisher={#Publisher}
 AppPublisherURL={#RepositoryUrl}
 AppSupportURL={#RepositoryUrl}
 AppUpdatesURL={#RepositoryUrl}
-DefaultDirName={localappdata}\Programs\{#Publisher}\{#AppName}
+DefaultDirName={localappdata}\Programs\{#Publisher}\{#TechnicalName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 DisableDirPage=no
@@ -47,7 +60,7 @@ WizardStyle=modern
 OutputDir={#OutputDir}
 OutputBaseFilename={#InstallerAssetName}
 SetupIconFile={#IconFile}
-UninstallDisplayIcon={app}\LocalDrop.exe
+UninstallDisplayIcon={app}\{#MainExecutable}
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
@@ -56,31 +69,38 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 Source: "{#AppImageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [InstallDelete]
-Type: files; Name: "{app}\LocalDrop.exe"
+Type: files; Name: "{app}\{#MainExecutable}"
 Type: filesandordirs; Name: "{app}\app"
 Type: filesandordirs; Name: "{app}\runtime"
 Type: filesandordirs; Name: "{app}\icons"
 
 [Icons]
-Name: "{group}\LocalDrop"; Filename: "{app}\LocalDrop.exe"
-Name: "{autodesktop}\LocalDrop"; Filename: "{app}\LocalDrop.exe"; Tasks: desktopicon
+Name: "{group}\{#AppName}"; Filename: "{app}\{#MainExecutable}"
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#MainExecutable}"; Tasks: desktopicon
 
 [Registry]
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "SchemaVersion"; ValueData: "1"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "AppId"; ValueData: "{#AppId}"
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "Name"; ValueData: "LocalDrop"
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "TechnicalName"; ValueData: "LocalDrop"
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "Version"; ValueData: "{#AppVersion}"
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "InstallLocation"; ValueData: "{app}"
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "Executable"; ValueData: "{app}\LocalDrop.exe"
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "ProcessName"; ValueData: "LocalDrop.exe"
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "Publisher"; ValueData: "{#Publisher}"
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "RepositoryUrl"; ValueData: "{#RepositoryUrl}"
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "InstallerType"; ValueData: "inno"
-Root: HKCU; Subkey: "Software\PashaApps\{#AppId}"; ValueType: string; ValueName: "InstalledBy"; ValueData: "installer"
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "SchemaVersion"; ValueData: "1"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "AppId"; ValueData: "{#AppId}"
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "Name"; ValueData: "{#AppName}"
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "TechnicalName"; ValueData: "{#TechnicalName}"
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "Version"; ValueData: "{#AppVersion}"
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "InstallLocation"; ValueData: "{app}"
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "Executable"; ValueData: "{app}\{#MainExecutable}"
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "ProcessName"; ValueData: "{#MainExecutable}"
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "Publisher"; ValueData: "{#Publisher}"
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "RepositoryUrl"; ValueData: "{#RepositoryUrl}"
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "InstallerType"; ValueData: "inno"
+Root: HKCU; Subkey: "Software\{#Publisher}\{#AppId}"; ValueType: string; ValueName: "InstalledBy"; ValueData: "installer"
 
 [Run]
-Filename: "{app}\LocalDrop.exe"; Description: "Launch LocalDrop"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MainExecutable}"; Description: "Launch {#AppName}"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+Type: files; Name: "{app}\{#MainExecutable}"
+Type: filesandordirs; Name: "{app}\app"
+Type: filesandordirs; Name: "{app}\runtime"
+Type: filesandordirs; Name: "{app}\icons"
+Type: dirifempty; Name: "{app}"
 
 [Code]
 const

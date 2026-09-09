@@ -10,6 +10,7 @@ public class DeviceInfo {
     private final String status;
     private final String hostAddress;
     private final int tcpPort;
+    private final List<TransferEndpoint> endpointCandidates;
     private final List<String> capabilities;
     private volatile long lastSeenAt;
 
@@ -23,12 +24,39 @@ public class DeviceInfo {
         List<String> capabilities,
         long lastSeenAt
     ) {
+        this(
+            deviceId,
+            deviceName,
+            deviceType,
+            status,
+            hostAddress,
+            tcpPort,
+            capabilities,
+            lastSeenAt,
+            List.of(new TransferEndpoint(hostAddress, tcpPort))
+        );
+    }
+
+    public DeviceInfo(
+        String deviceId,
+        String deviceName,
+        String deviceType,
+        String status,
+        String hostAddress,
+        int tcpPort,
+        List<String> capabilities,
+        long lastSeenAt,
+        List<TransferEndpoint> endpointCandidates
+    ) {
         this.deviceId = deviceId;
         this.deviceName = deviceName;
         this.deviceType = deviceType;
         this.status = status;
         this.hostAddress = hostAddress;
         this.tcpPort = tcpPort;
+        this.endpointCandidates = endpointCandidates == null || endpointCandidates.isEmpty()
+            ? List.of(new TransferEndpoint(hostAddress, tcpPort))
+            : List.copyOf(endpointCandidates);
         this.capabilities = capabilities == null ? List.of() : List.copyOf(capabilities);
         this.lastSeenAt = lastSeenAt;
     }
@@ -57,6 +85,24 @@ public class DeviceInfo {
         return tcpPort;
     }
 
+    public List<TransferEndpoint> getEndpointCandidates() {
+        return endpointCandidates;
+    }
+
+    public DeviceInfo withActiveEndpoint(TransferEndpoint endpoint) {
+        return new DeviceInfo(
+            deviceId,
+            deviceName,
+            deviceType,
+            status,
+            endpoint.hostAddress(),
+            endpoint.tcpPort(),
+            capabilities,
+            lastSeenAt,
+            endpointCandidates
+        );
+    }
+
     public List<String> getCapabilities() {
         return new ArrayList<>(capabilities);
     }
@@ -78,5 +124,8 @@ public class DeviceInfo {
             case "BUSY" -> "Busy";
             default -> "Online";
         };
+    }
+
+    public record TransferEndpoint(String hostAddress, int tcpPort) {
     }
 }

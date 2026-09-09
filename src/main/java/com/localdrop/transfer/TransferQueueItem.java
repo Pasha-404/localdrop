@@ -19,6 +19,7 @@ public class TransferQueueItem {
     private final ObjectProperty<TransferStatus> status = new SimpleObjectProperty<>(TransferStatus.QUEUED);
     private final StringProperty message = new SimpleStringProperty("");
     private final DoubleProperty progress = new SimpleDoubleProperty(0);
+    private String reservedBatchId;
 
     public TransferQueueItem(Path sourcePath, String relativePath, long size, long lastModified) {
         this.sourcePath = sourcePath;
@@ -79,6 +80,15 @@ public class TransferQueueItem {
         this.progress.set(progress);
     }
 
+    /** Progress is telemetry; it must not change the transfer phase. */
+    public boolean updateProgressIfSending(double progress) {
+        if (getStatus() != TransferStatus.SENDING) {
+            return false;
+        }
+        setProgress(progress);
+        return true;
+    }
+
     public DoubleProperty progressProperty() {
         return progress;
     }
@@ -88,6 +98,30 @@ public class TransferQueueItem {
     }
 
     public boolean canRemove() {
-        return getStatus() != TransferStatus.SENDING;
+        return reservedBatchId == null;
+    }
+
+    public boolean isEligibleForNewTransfer() {
+        return getStatus() == TransferStatus.QUEUED
+            || getStatus() == TransferStatus.FAILED
+            || getStatus() == TransferStatus.WAITING_FOR_RETRY;
+    }
+
+    public boolean reserve(String batchId) {
+        if (batchId == null || batchId.isBlank() || reservedBatchId != null) {
+            return false;
+        }
+        reservedBatchId = batchId;
+        return true;
+    }
+
+    public boolean isReservedBy(String batchId) {
+        return batchId != null && batchId.equals(reservedBatchId);
+    }
+
+    public void release(String batchId) {
+        if (isReservedBy(batchId)) {
+            reservedBatchId = null;
+        }
     }
 }

@@ -23,6 +23,7 @@ import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 public class TransferClient {
@@ -44,6 +45,10 @@ public class TransferClient {
         void onTransferIssue(String targetDeviceName, String details);
 
         void onReceiverRejected(String reason);
+
+        default void onSessionFinishUnconfirmed(String targetDeviceName, String details) {
+            // All FILE_ACK responses were confirmed; only the terminal session acknowledgement is missing.
+        }
 
         void onTransferFinished();
     }
@@ -99,9 +104,11 @@ public class TransferClient {
         TransferQueueItem currentItem = null;
         TransferPhase phase = TransferPhase.CONNECT;
 
-        try (Socket socket = new Socket()) {
+        try {
+            ConnectedTarget connection = connectToTarget(target);
+            target = connection.target();
+            try (Socket socket = connection.socket()) {
             recordEvent(DiagnosticEventType.TRANSFER_CLIENT_CONNECTING, target, null, "Connecting to receiver.");
-            socket.connect(new InetSocketAddress(target.getHostAddress(), target.getTcpPort()), ProtocolConstants.CONNECT_TIMEOUT_MS);
             recordEvent(DiagnosticEventType.TRANSFER_CLIENT_CONNECTED, target, null, "Connected to receiver.");
             socket.setSoTimeout(ProtocolConstants.HEADER_READ_TIMEOUT_MS);
 
@@ -120,6 +127,12 @@ public class TransferClient {
 
                 ProtocolMessage response = ProtocolMessage.read(input);
                 if (ProtocolConstants.TYPE_SESSION_REJECTED.equals(response.getType())) {
+                    if (!isExpectedResponse(response, ProtocolConstants.TYPE_SESSION_REJECTED, sessionId, null, target.getDeviceId())) {
+                        markRemaining(items, TransferStatus.WAITING_FOR_RETRY, ProtocolConstants.ERROR_ACK_MISMATCH, listener);
+                        listener.onTransferIssue(target.getDeviceName(), ProtocolConstants.ERROR_ACK_MISMATCH);
+                        recordEvent(DiagnosticEventType.TRANSFER_CLIENT_ERROR, target, ProtocolConstants.ERROR_ACK_MISMATCH, "Mismatched SESSION_REJECTED response.");
+                        return;
+                    }
                     markRemaining(items, TransferStatus.WAITING_FOR_RETRY, "", listener);
                     listener.onReceiverRejected(resolveProtocolError(response));
                     recordEvent(DiagnosticEventType.TRANSFER_CLIENT_ERROR, target, response.getErrorCode(), "Receiver rejected the session.");
@@ -185,19 +198,58 @@ public class TransferClient {
                 ProtocolMessage.write(output, ProtocolMessage.sessionFinish(sessionId, senderDeviceId));
                 ProtocolMessage finalResponse = ProtocolMessage.read(input);
                 if (!isExpectedResponse(finalResponse, ProtocolConstants.TYPE_SESSION_FINISH_ACK, sessionId, null, target.getDeviceId())) {
-                    listener.onTransferIssue(target.getDeviceName(), ProtocolConstants.ERROR_MALFORMED_MESSAGE);
+                    listener.onSessionFinishUnconfirmed(target.getDeviceName(), ProtocolConstants.ERROR_MALFORMED_MESSAGE);
                     recordEvent(DiagnosticEventType.TRANSFER_CLIENT_ERROR, target, ProtocolConstants.ERROR_MALFORMED_MESSAGE, "Receiver did not confirm session finish.");
                     return;
                 }
                 logger.info("Completed transfer session " + sessionId + " to " + target.getDeviceName());
             }
+            }
         } catch (TransferException exception) {
-            handleFailure(target, items, currentItem, listener, exception.getErrorCode(), exception.getMessage());
+            handleFailure(target, items, currentItem, listener, phase, exception.getErrorCode(), exception.getMessage());
         } catch (IOException exception) {
-            handleFailure(target, items, currentItem, listener, mapIoErrorCode(exception, phase), resolveIoMessage(exception, phase));
+            handleFailure(target, items, currentItem, listener, phase, mapIoErrorCode(exception, phase), resolveIoMessage(exception, phase));
         } finally {
             listener.onTransferFinished();
         }
+    }
+
+    private ConnectedTarget connectToTarget(DeviceInfo target) throws IOException {
+        IOException lastFailure = null;
+        List<DeviceInfo.TransferEndpoint> endpoints = target.getEndpointCandidates().stream()
+            .distinct()
+            .limit(ProtocolConstants.MAX_FRESH_ENDPOINTS_PER_DEVICE)
+            .toList();
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ProtocolConstants.CONNECT_TIMEOUT_MS);
+        for (DeviceInfo.TransferEndpoint endpoint : endpoints) {
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0) {
+                break;
+            }
+            Socket socket = new Socket();
+            try {
+                socket.connect(
+                    new InetSocketAddress(endpoint.hostAddress(), endpoint.tcpPort()),
+                    (int) Math.max(1L, TimeUnit.NANOSECONDS.toMillis(remainingNanos))
+                );
+                return new ConnectedTarget(socket, target.withActiveEndpoint(endpoint));
+            } catch (IOException exception) {
+                closeQuietly(socket);
+                lastFailure = exception;
+            }
+        }
+        throw lastFailure == null ? new IOException("No endpoint is available for the selected device.") : lastFailure;
+    }
+
+    private void closeQuietly(Socket socket) {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // The failed connection is already unusable.
+        }
+    }
+
+    private record ConnectedTarget(Socket socket, DeviceInfo target) {
     }
 
     private void streamFile(
@@ -261,7 +313,7 @@ public class TransferClient {
         if (message == null || !expectedType.equals(message.getType())) {
             return false;
         }
-        if (!Integer.valueOf(ProtocolConstants.PROTOCOL_VERSION).equals(message.getProtocolVersion())) {
+        if (!hasCommonEnvelope(message)) {
             return false;
         }
         if (sessionId != null && !sessionId.equals(message.getSessionId())) {
@@ -285,11 +337,19 @@ public class TransferClient {
         if (!Integer.valueOf(ProtocolConstants.PROTOCOL_VERSION).equals(ack.getProtocolVersion())) {
             return ProtocolConstants.ERROR_PROTOCOL_VERSION_MISMATCH;
         }
+        if (!hasCommonEnvelope(ack)) {
+            return ProtocolConstants.ERROR_MALFORMED_MESSAGE;
+        }
         if (!sessionId.equals(ack.getSessionId()) || !fileId.equals(ack.getFileId())) {
             return ProtocolConstants.ERROR_ACK_MISMATCH;
         }
         if (expectedDeviceId != null && !expectedDeviceId.equals(ack.getDeviceId())) {
             return ProtocolConstants.ERROR_ACK_MISMATCH;
+        }
+        if (ack.getErrorCode() != null
+            && !ack.getErrorCode().isBlank()
+            && !ProtocolConstants.ERROR_NONE.equals(ack.getErrorCode())) {
+            return resolveProtocolError(ack);
         }
         if (Boolean.FALSE.equals(ack.getSuccess())
             || Boolean.FALSE.equals(ack.getChecksumOk())
@@ -305,6 +365,14 @@ public class TransferClient {
         return null;
     }
 
+    private static boolean hasCommonEnvelope(ProtocolMessage message) {
+        return Integer.valueOf(ProtocolConstants.PROTOCOL_VERSION).equals(message.getProtocolVersion())
+            && message.getMessageId() != null && !message.getMessageId().isBlank()
+            && message.getTimestamp() != null
+            && message.getDeviceId() != null && !message.getDeviceId().isBlank()
+            && message.getDeviceId().length() <= ProtocolConstants.MAX_DEVICE_ID_LENGTH;
+    }
+
     private void markRemaining(List<TransferQueueItem> items, TransferStatus status, String message, Listener listener) {
         for (TransferQueueItem item : items) {
             listener.onItemStatusChanged(item, status, message);
@@ -317,20 +385,28 @@ public class TransferClient {
         List<TransferQueueItem> items,
         TransferQueueItem currentItem,
         Listener listener,
+        TransferPhase phase,
         String errorCode,
         String details
     ) {
         String message = details == null || details.isBlank() ? errorCode : details;
         if (currentItem != null) {
-            listener.onItemStatusChanged(currentItem, TransferStatus.FAILED, message);
+            TransferStatus currentStatus = phase == TransferPhase.FILE_ACK
+                ? TransferStatus.DELIVERY_UNKNOWN
+                : TransferStatus.FAILED;
+            listener.onItemStatusChanged(currentItem, currentStatus, message);
             int failedIndex = items.indexOf(currentItem);
             if (failedIndex >= 0 && failedIndex + 1 < items.size()) {
                 markRemaining(items.subList(failedIndex + 1, items.size()), TransferStatus.WAITING_FOR_RETRY, "", listener);
             }
+        } else if (phase == TransferPhase.FINISH_ACK) {
+            listener.onSessionFinishUnconfirmed(target.getDeviceName(), message);
         } else {
             markRemaining(items, TransferStatus.WAITING_FOR_RETRY, "", listener);
         }
-        listener.onTransferIssue(target.getDeviceName(), message);
+        if (phase != TransferPhase.FINISH_ACK) {
+            listener.onTransferIssue(target.getDeviceName(), message);
+        }
         recordEvent(DiagnosticEventType.TRANSFER_CLIENT_ERROR, target, errorCode, message);
         logger.warning("Transfer session failed: " + message);
     }

@@ -6,7 +6,9 @@ import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.util.jar.JarFile
 import java.util.Locale
+import java.util.Properties
 import javax.imageio.ImageIO
 
 plugins {
@@ -15,7 +17,27 @@ plugins {
 }
 
 group = 'com.localdrop'
-version = '2.3.0'
+
+def requireGradleProperty = { String name ->
+    String value = providers.gradleProperty(name).getOrNull()
+    if (value == null || value.isBlank()) {
+        throw new GradleException("Required Gradle property '${name}' is missing.")
+    }
+    value.trim()
+}
+
+def installerVersion = requireGradleProperty('version')
+if (!(installerVersion ==~ /\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?/)) {
+    throw new GradleException("Version '${installerVersion}' is not valid SemVer.")
+}
+def installerAppName = requireGradleProperty('appName')
+def technicalName = requireGradleProperty('technicalName')
+def mainExecutable = "${technicalName}.exe"
+def publisher = requireGradleProperty('publisher')
+def repositoryUrl = requireGradleProperty('repositoryUrl')
+def appId = requireGradleProperty('appId')
+def legacyMsiUpgradeCode = requireGradleProperty('legacyMsiUpgradeCode')
+version = installerVersion
 
 repositories {
     mavenCentral()
@@ -54,36 +76,38 @@ tasks.named('test') {
 }
 
 tasks.named('processResources') {
-    inputs.property('appVersion', project.version.toString())
-    filesMatching('com/localdrop/i18n/messages_*.properties') {
-        filter { String line -> line.replace('@APP_VERSION@', project.version.toString()) }
+    inputs.properties([appVersion: installerVersion, appId: appId, repositoryUrl: repositoryUrl])
+    filesMatching(['com/localdrop/i18n/messages_*.properties', 'com/localdrop/build-info.properties']) {
+        filter { String line -> line
+            .replace('@APP_VERSION@', installerVersion)
+            .replace('@APP_ID@', appId)
+            .replace('@REPOSITORY_URL@', repositoryUrl) }
     }
 }
 
 jar {
     manifest {
-        attributes 'Main-Class': application.mainClass.get()
+        attributes(
+            'Main-Class': application.mainClass.get(),
+            'Implementation-Version': installerVersion,
+            'LocalDrop-App-Id': appId,
+            'LocalDrop-Repository-Url': repositoryUrl
+        )
     }
 }
 
 def isWindows = System.getProperty('os.name').toLowerCase(Locale.ROOT).contains('windows')
-def installerAppName = 'LocalDrop'
-def installerVersion = project.version.toString()
 def installerDescription = 'Local network file transfer'
-def publisher = 'PashaApps'
-def repositoryUrl = 'https://github.com/Pasha-404/localdrop'
-def appId = 'a96d2beb-644f-4461-aaea-cc00c58c3917'
-def legacyMsiUpgradeCode = '6af7e2f8-87f9-4f90-9f34-4553c379785c'
-def installerAssetName = "${installerAppName}-Setup-${installerVersion}-x64.exe"
+def installerAssetName = "${technicalName}-Setup-${installerVersion}-x64.exe"
 def installerSha256Name = "${installerAssetName}.sha256"
 
 def jpackageInputDir = layout.buildDirectory.dir('jpackage/input')
 def jpackageRootDir = layout.buildDirectory.dir('jpackage')
-def appImageDir = layout.buildDirectory.dir("jpackage/${installerAppName}")
-def generatedWindowsIcon = layout.buildDirectory.file('jpackage/localdrop.ico')
-def externalRootIcoIcon = file('localdrop-icon.ico')
+def appImageDir = layout.buildDirectory.dir("jpackage/${technicalName}")
+def generatedWindowsIcon = layout.buildDirectory.file("jpackage/${technicalName}.ico")
 def innoScript = file('installer/windows/inno/LocalDrop.iss')
 def innoOutputDir = layout.buildDirectory.dir('inno')
+def innoStagingOutputDir = layout.buildDirectory.dir('inno/staging')
 def installerFile = layout.buildDirectory.file("inno/${installerAssetName}")
 def appFleetManifestFile = layout.buildDirectory.file('release/appfleet-manifest.json')
 def sha256File = layout.buildDirectory.file("release/${installerSha256Name}")
@@ -124,21 +148,12 @@ def resolveInnoSetupCompiler = {
 tasks.register('generateWindowsInstallerIcon') {
     description = 'Generates a Windows ICO file for the app image and Inno Setup installer.'
     group = 'distribution'
-    inputs.files('src/main/resources/com/localdrop/icons/app.png', 'localdrop-icon.ico')
+    inputs.file('src/main/resources/com/localdrop/icons/app.png')
     outputs.file(generatedWindowsIcon)
 
     doLast {
         File iconFile = generatedWindowsIcon.get().asFile
         iconFile.parentFile.mkdirs()
-
-        if (externalRootIcoIcon.exists()) {
-            copy {
-                from externalRootIcoIcon
-                into iconFile.parentFile
-                rename { 'localdrop.ico' }
-            }
-            return
-        }
 
         File sourceFile = file('src/main/resources/com/localdrop/icons/app.png')
         BufferedImage sourceImage = ImageIO.read(sourceFile)
@@ -146,17 +161,20 @@ tasks.register('generateWindowsInstallerIcon') {
             throw new GradleException("Unable to read icon source ${sourceFile}")
         }
 
-        BufferedImage scaled = new BufferedImage(256, 256, BufferedImage.TYPE_INT_ARGB)
-        Graphics2D graphics = scaled.createGraphics()
-        graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC)
-        graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY)
-        graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
-        graphics.drawImage(sourceImage, 0, 0, 256, 256, null)
-        graphics.dispose()
+        List<Integer> sizes = [16, 32, 48, 64, 128, 256]
+        List<byte[]> imagePayloads = sizes.collect { int size ->
+            BufferedImage scaled = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB)
+            Graphics2D graphics = scaled.createGraphics()
+            graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC)
+            graphics.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY)
+            graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON)
+            graphics.drawImage(sourceImage, 0, 0, size, size, null)
+            graphics.dispose()
 
-        ByteArrayOutputStream pngBuffer = new ByteArrayOutputStream()
-        ImageIO.write(scaled, 'png', pngBuffer)
-        byte[] pngBytes = pngBuffer.toByteArray()
+            ByteArrayOutputStream pngBuffer = new ByteArrayOutputStream()
+            ImageIO.write(scaled, 'png', pngBuffer)
+            pngBuffer.toByteArray()
+        }
 
         iconFile.withOutputStream { output ->
             def writeWord = { int value ->
@@ -172,21 +190,88 @@ tasks.register('generateWindowsInstallerIcon') {
 
             writeWord(0)
             writeWord(1)
-            writeWord(1)
-            output.write(0)
-            output.write(0)
-            output.write(0)
-            output.write(0)
-            writeWord(1)
-            writeWord(32)
-            writeDword(pngBytes.length)
-            writeDword(22)
-            output.write(pngBytes)
+            writeWord(sizes.size())
+            int payloadOffset = 6 + sizes.size() * 16
+            sizes.eachWithIndex { int size, int index ->
+                output.write(size == 256 ? 0 : size)
+                output.write(size == 256 ? 0 : size)
+                output.write(0)
+                output.write(0)
+                writeWord(1)
+                writeWord(32)
+                writeDword(imagePayloads[index].length)
+                writeDword(payloadOffset)
+                payloadOffset += imagePayloads[index].length
+            }
+            imagePayloads.each { byte[] payload -> output.write(payload) }
         }
     }
 }
 
-tasks.register('prepareJpackageInput', Copy) {
+tasks.register('verifyWindowsInstallerIcon') {
+    description = 'Verifies that the generated ICO contains every Windows icon layer required by AppFleet.'
+    group = 'verification'
+    dependsOn 'generateWindowsInstallerIcon'
+    inputs.file(generatedWindowsIcon)
+
+    doLast {
+        byte[] ico = generatedWindowsIcon.get().asFile.bytes
+        if (ico.length < 6 || (ico[0] & 0xFF) != 0 || (ico[1] & 0xFF) != 0
+            || (ico[2] & 0xFF) != 1 || (ico[3] & 0xFF) != 0) {
+            throw new GradleException('Generated Windows icon is not a valid ICO file.')
+        }
+        int imageCount = (ico[4] & 0xFF) | ((ico[5] & 0xFF) << 8)
+        if (ico.length < 6 + imageCount * 16) {
+            throw new GradleException('Generated Windows icon has a truncated directory.')
+        }
+        Set<Integer> actualSizes = (0..<imageCount).collect { int index ->
+            int width = ico[6 + index * 16] & 0xFF
+            width == 0 ? 256 : width
+        }.toSet()
+        Set<Integer> requiredSizes = [16, 32, 48, 64, 128, 256] as Set
+        if (actualSizes != requiredSizes) {
+            throw new GradleException("Generated Windows icon layers ${actualSizes} do not match ${requiredSizes}.")
+        }
+    }
+}
+
+tasks.register('verifyEmbeddedBuildMetadata') {
+    description = 'Verifies version, AppId, and repository URL in the final application JAR.'
+    group = 'verification'
+    dependsOn tasks.jar
+
+    doLast {
+        File applicationJar = tasks.jar.archiveFile.get().asFile
+        JarFile jarFile = new JarFile(applicationJar)
+        try {
+            Map<String, String> expectedManifest = [
+                'Implementation-Version': installerVersion,
+                'LocalDrop-App-Id': appId,
+                'LocalDrop-Repository-Url': repositoryUrl
+            ]
+            expectedManifest.each { String key, String expectedValue ->
+                if (jarFile.manifest.mainAttributes.getValue(key) != expectedValue) {
+                    throw new GradleException("Application JAR manifest field ${key} does not match release metadata.")
+                }
+            }
+            def buildInfoEntry = jarFile.getJarEntry('com/localdrop/build-info.properties')
+            if (buildInfoEntry == null) {
+                throw new GradleException('Application JAR is missing embedded build-info.properties.')
+            }
+            Properties buildInfo = new Properties()
+            jarFile.getInputStream(buildInfoEntry).withCloseable { input -> buildInfo.load(input) }
+            if (buildInfo.getProperty('version') != installerVersion
+                || buildInfo.getProperty('appId') != appId
+                || buildInfo.getProperty('repositoryUrl') != repositoryUrl) {
+                throw new GradleException('Embedded build-info.properties does not match release metadata.')
+            }
+        } finally {
+            jarFile.close()
+        }
+    }
+}
+
+tasks.register('prepareJpackageInput', Sync) {
     description = 'Collects application JARs for jpackage.'
     group = 'distribution'
     dependsOn tasks.installDist
@@ -197,7 +282,7 @@ tasks.register('prepareJpackageInput', Copy) {
 tasks.register('packageAppImage', Exec) {
     description = 'Builds a self-contained LocalDrop app image with jpackage.'
     group = 'distribution'
-    dependsOn 'prepareJpackageInput', 'generateWindowsInstallerIcon'
+    dependsOn 'prepareJpackageInput', 'generateWindowsInstallerIcon', 'verifyWindowsInstallerIcon', 'verifyEmbeddedBuildMetadata'
     inputs.dir(jpackageInputDir)
     inputs.file(generatedWindowsIcon)
     outputs.dir(appImageDir)
@@ -223,28 +308,83 @@ tasks.register('packageAppImage', Exec) {
     )
 }
 
+tasks.register('verifyAppImageIconResources', Exec) {
+    description = 'Verifies that the final LocalDrop app-image EXE embeds native Windows icon resources.'
+    group = 'verification'
+    dependsOn 'packageAppImage'
+    inputs.dir(appImageDir)
+    inputs.file('scripts/verify-exe-icon.ps1')
+    onlyIf { isWindows }
+
+    doFirst {
+        File executable = new File(appImageDir.get().asFile, mainExecutable)
+        if (!executable.isFile()) {
+            throw new GradleException("Expected app-image executable was not created: ${executable}")
+        }
+        commandLine(
+            'powershell.exe',
+            '-NoProfile',
+            '-NonInteractive',
+            '-ExecutionPolicy', 'Bypass',
+            '-File', file('scripts/verify-exe-icon.ps1').absolutePath,
+            '-ExecutablePath', executable.absolutePath
+        )
+    }
+}
+
 tasks.register('compileInnoInstaller', Exec) {
     description = 'Builds the LocalDrop per-user Windows installer with Inno Setup.'
     group = 'distribution'
-    dependsOn 'packageAppImage'
+    dependsOn 'verifyAppImageIconResources'
+    doNotTrackState('Inno Setup replaces its output EXE atomically; the release compiler must always run.')
     inputs.dir(appImageDir)
     inputs.file(generatedWindowsIcon)
     inputs.file(innoScript)
-    inputs.properties([appId: appId, appVersion: installerVersion, legacyMsiUpgradeCode: legacyMsiUpgradeCode])
+    inputs.properties([
+        appId: appId,
+        appName: installerAppName,
+        appVersion: installerVersion,
+        technicalName: technicalName,
+        mainExecutable: mainExecutable,
+        publisher: publisher,
+        repositoryUrl: repositoryUrl,
+        legacyMsiUpgradeCode: legacyMsiUpgradeCode
+    ])
     outputs.file(installerFile)
     onlyIf { isWindows }
 
     doFirst {
         innoOutputDir.get().asFile.mkdirs()
+        delete(innoStagingOutputDir)
+        innoStagingOutputDir.get().asFile.mkdirs()
         commandLine(
             resolveInnoSetupCompiler(),
             "/DAppVersion=${installerVersion}",
             "/DAppImageDir=${appImageDir.get().asFile.absolutePath}",
-            "/DOutputDir=${innoOutputDir.get().asFile.absolutePath}",
+            "/DOutputDir=${innoStagingOutputDir.get().asFile.absolutePath}",
             "/DAppId=${appId}",
+            "/DAppName=${installerAppName}",
+            "/DTechnicalName=${technicalName}",
+            "/DMainExecutable=${mainExecutable}",
+            "/DPublisher=${publisher}",
+            "/DRepositoryUrl=${repositoryUrl}",
             "/DIconFile=${generatedWindowsIcon.get().asFile.absolutePath}",
             "/DLegacyMsiUpgradeCode={${legacyMsiUpgradeCode}}",
             innoScript.absolutePath
+        )
+    }
+
+    doLast {
+        File stagedInstaller = new File(innoStagingOutputDir.get().asFile, installerAssetName)
+        if (!stagedInstaller.isFile() || stagedInstaller.length() == 0) {
+            throw new GradleException("Inno Setup did not produce the expected staged installer: ${stagedInstaller}")
+        }
+
+        File publishedInstaller = installerFile.get().asFile
+        java.nio.file.Files.copy(
+            stagedInstaller.toPath(),
+            publishedInstaller.toPath(),
+            java.nio.file.StandardCopyOption.REPLACE_EXISTING
         )
     }
 }
@@ -252,7 +392,19 @@ tasks.register('compileInnoInstaller', Exec) {
 tasks.register('generateAppFleetManifest') {
     description = 'Generates the AppFleet metadata manifest for the Windows installer.'
     group = 'distribution'
-    inputs.properties([appId: appId, appVersion: installerVersion, installerAssetName: installerAssetName, installerSha256Name: installerSha256Name])
+    outputs.upToDateWhen { false }
+    inputs.properties([
+        manifestSchemaContract: 'appfleet-schema-1-desktopicon-2.0.0',
+        appId: appId,
+        appName: installerAppName,
+        appVersion: installerVersion,
+        technicalName: technicalName,
+        mainExecutable: mainExecutable,
+        publisher: publisher,
+        repositoryUrl: repositoryUrl,
+        installerAssetName: installerAssetName,
+        installerSha256Name: installerSha256Name
+    ])
     outputs.file(appFleetManifestFile)
 
     doLast {
@@ -262,7 +414,7 @@ tasks.register('generateAppFleetManifest') {
             schemaVersion: 1,
             appId: appId,
             name: installerAppName,
-            technicalName: installerAppName,
+            technicalName: technicalName,
             version: installerVersion,
             repositoryUrl: repositoryUrl,
             platform: 'windows',
@@ -271,15 +423,16 @@ tasks.register('generateAppFleetManifest') {
                 type: 'inno',
                 assetName: installerAssetName,
                 sha256AssetName: installerSha256Name,
-                silentArgs: ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS']
+                silentArgs: ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS'],
+                desktopShortcutTask: 'desktopicon'
             ],
             detection: [
                 registryKey: "HKCU\\Software\\${publisher}\\${appId}",
                 versionValue: 'Version',
                 executableValue: 'Executable'
             ],
-            processNames: ['LocalDrop.exe'],
-            minimumAppFleetVersion: '1.0.0'
+            processNames: [mainExecutable],
+            minimumAppFleetVersion: '2.0.0'
         ]
         manifest.setText(JsonOutput.prettyPrint(JsonOutput.toJson(content)) + System.lineSeparator(), StandardCharsets.UTF_8.name())
     }
@@ -301,6 +454,7 @@ tasks.register('writeInstallerSha256') {
     description = 'Writes the SHA-256 checksum for the Windows installer.'
     group = 'distribution'
     dependsOn 'compileInnoInstaller'
+    outputs.upToDateWhen { false }
     inputs.file(installerFile)
     outputs.file(sha256File)
 
@@ -335,10 +489,35 @@ tasks.register('verifyReleaseVersion') {
     }
 }
 
+tasks.register('verifyGitHubReleasePublicationPolicy') {
+    description = 'Guards the GitHub workflow against overwriting published release assets.'
+    group = 'verification'
+    File workflow = file('.github/workflows/windows-installer.yml')
+    inputs.file(workflow)
+
+    doLast {
+        String workflowText = workflow.getText(StandardCharsets.UTF_8.name())
+        if (workflowText =~ /(?m)^\s*gh release upload .*--clobber/) {
+            throw new GradleException('GitHub release workflow must not overwrite an existing release asset.')
+        }
+        List<String> requiredGuards = [
+            'gh release download $env:TAG_NAME --pattern $asset.Name',
+            'Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256',
+            'Published artifacts are immutable; create a new version.',
+            'gh release edit $env:TAG_NAME --draft=false'
+        ]
+        requiredGuards.each { String guard ->
+            if (!workflowText.contains(guard)) {
+                throw new GradleException("GitHub release workflow is missing immutable-release guard: ${guard}")
+            }
+        }
+    }
+}
+
 tasks.register('verifyReleaseArtifacts') {
     description = 'Validates the installer, checksum, and AppFleet manifest as one release set.'
     group = 'verification'
-    dependsOn 'assembleReleaseArtifacts'
+    dependsOn 'assembleReleaseArtifacts', 'verifyEmbeddedBuildMetadata', 'verifyWindowsInstallerIcon', 'verifyGitHubReleasePublicationPolicy'
 
     doLast {
         Set<String> expectedFiles = [installerAssetName, installerSha256Name, 'appfleet-manifest.json'] as Set
@@ -347,17 +526,43 @@ tasks.register('verifyReleaseArtifacts') {
             throw new GradleException("Unexpected release artifact set in ${releaseDirectory}: ${actualFiles}")
         }
 
+        Map expectedManifest = [
+            schemaVersion: 1,
+            appId: appId,
+            name: installerAppName,
+            technicalName: technicalName,
+            version: installerVersion,
+            repositoryUrl: repositoryUrl,
+            platform: 'windows',
+            architecture: 'x64',
+            installer: [
+                type: 'inno',
+                assetName: installerAssetName,
+                sha256AssetName: installerSha256Name,
+                silentArgs: ['/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/CLOSEAPPLICATIONS'],
+                desktopShortcutTask: 'desktopicon'
+            ],
+            detection: [
+                registryKey: "HKCU\\Software\\${publisher}\\${appId}",
+                versionValue: 'Version',
+                executableValue: 'Executable'
+            ],
+            processNames: [mainExecutable],
+            minimumAppFleetVersion: '2.0.0'
+        ]
         Map manifestData = new JsonSlurper().parse(new File(releaseDirectory, 'appfleet-manifest.json')) as Map
-        if (manifestData.appId != appId || manifestData.version != installerVersion ||
-            manifestData.installer.assetName != installerAssetName ||
-            manifestData.installer.sha256AssetName != installerSha256Name) {
-            throw new GradleException('AppFleet manifest does not match the current application version and installer metadata.')
+        if (manifestData != expectedManifest) {
+            throw new GradleException('AppFleet manifest does not exactly match the validated release metadata contract.')
         }
 
         File installer = new File(releaseDirectory, installerAssetName)
+        if (!installer.isFile() || installer.length() == 0) {
+            throw new GradleException('Windows installer artifact is missing or empty.')
+        }
         String actualHash = installerSha256(installer)
-        String expectedHash = new File(releaseDirectory, installerSha256Name).getText(StandardCharsets.UTF_8.name()).trim().split(/\s+/)[0]
-        if (actualHash != expectedHash) {
+        String expectedChecksumLine = "${actualHash}  ${installerAssetName}"
+        String checksumText = new File(releaseDirectory, installerSha256Name).getText(StandardCharsets.UTF_8.name())
+        if (checksumText.trim() != expectedChecksumLine) {
             throw new GradleException('Installer SHA-256 file does not match the generated installer.')
         }
     }

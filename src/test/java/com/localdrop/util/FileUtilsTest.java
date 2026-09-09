@@ -6,12 +6,10 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.attribute.FileTime;
-import java.time.Instant;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 
 class FileUtilsTest {
     @TempDir
@@ -35,16 +33,21 @@ class FileUtilsTest {
     }
 
     @Test
-    void cleansUpExpiredPartialFiles() throws IOException {
-        Path oldPart = tempDir.resolve("old.localdrop-part");
-        Path freshPart = tempDir.resolve("fresh.localdrop-part");
-        Files.writeString(oldPart, "old");
-        Files.writeString(freshPart, "fresh");
-        Files.setLastModifiedTime(oldPart, FileTime.from(Instant.now().minusSeconds(2 * 24 * 60 * 60)));
-
-        FileUtils.cleanupPartialFiles(tempDir, 24L * 60L * 60L * 1000L);
-
-        assertFalse(Files.exists(oldPart));
-        assertEquals("fresh", Files.readString(freshPart));
+    void rejectsRelativePathWhoseLeafDoesNotMatchFileName() {
+        assertThrows(IOException.class, () -> FileUtils.sanitizeReceivedRelativePath("safe/other.txt", "file.txt"));
     }
+
+    @Test
+    void excludesInternalReceiveStagingFromFolderTransfers() throws IOException {
+        Path selectedFolder = Files.createDirectories(tempDir.resolve("selected"));
+        Files.writeString(selectedFolder.resolve("keep.txt"), "user file");
+        Path stagingPayload = selectedFolder.resolve(".localdrop-staging").resolve("operation").resolve("payload.bin");
+        Files.createDirectories(stagingPayload.getParent());
+        Files.writeString(stagingPayload, "incomplete internal payload");
+
+        List<FileUtils.TransferSource> sources = FileUtils.collectTransferSources(selectedFolder);
+
+        assertEquals(List.of("selected/keep.txt"), sources.stream().map(FileUtils.TransferSource::relativePath).toList());
+    }
+
 }

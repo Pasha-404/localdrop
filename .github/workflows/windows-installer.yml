@@ -40,7 +40,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Create or update GitHub release
+      - name: Publish or verify immutable GitHub release
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
         env:
@@ -48,14 +48,108 @@ jobs:
           TAG_NAME: ${{ github.ref_name }}
           RELEASE_DIRECTORY: dist/release
         run: |
-          $assets = Get-ChildItem -Path $env:RELEASE_DIRECTORY -Recurse -File
+          $assets = @(Get-ChildItem -Path $env:RELEASE_DIRECTORY -Recurse -File | Sort-Object Name)
           if ($assets.Count -ne 3) {
             throw "Expected exactly three release artifacts, found $($assets.Count)"
           }
-          gh release view $env:TAG_NAME *> $null
+
+          $expectedNames = @($assets.Name | Sort-Object)
+          if ($expectedNames.Count -ne @($expectedNames | Select-Object -Unique).Count) {
+            throw 'Release artifact names must be unique.'
+          }
+
+          $releaseJson = gh release view $env:TAG_NAME --json isDraft,isPrerelease,assets 2>$null
           if ($LASTEXITCODE -ne 0) {
             gh release create $env:TAG_NAME $assets.FullName --title $env:TAG_NAME --generate-notes
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not create GitHub release $($env:TAG_NAME)."
+            }
+            exit 0
           }
-          else {
-            gh release upload $env:TAG_NAME $assets.FullName --clobber
+
+          $release = $releaseJson | ConvertFrom-Json
+          if ($release.isPrerelease) {
+            throw "Existing release $($env:TAG_NAME) is a prerelease and cannot be used for a stable artifact set."
+          }
+
+          $remoteAssets = @($release.assets)
+          $remoteNames = @($remoteAssets.name | Sort-Object)
+          $unexpectedNames = @($remoteNames | Where-Object { $_ -notin $expectedNames })
+          if ($unexpectedNames.Count -gt 0) {
+            throw "Existing release has unexpected assets: $($unexpectedNames -join ', '). Create a new version instead of modifying this release."
+          }
+
+          $verificationDirectory = Join-Path $env:RUNNER_TEMP "localdrop-release-verify-$PID"
+          New-Item -ItemType Directory -Path $verificationDirectory -Force | Out-Null
+          try {
+            $missingAssets = @()
+            foreach ($asset in $assets) {
+              $matchingRemoteAssets = @($remoteAssets | Where-Object { $_.name -eq $asset.Name })
+              if ($matchingRemoteAssets.Count -gt 1) {
+                throw "Existing release contains duplicate asset entries named $($asset.Name)."
+              }
+              if ($matchingRemoteAssets.Count -eq 0) {
+                $missingAssets += $asset
+                continue
+              }
+
+              gh release download $env:TAG_NAME --pattern $asset.Name --dir $verificationDirectory
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not download existing release asset $($asset.Name) for verification."
+              }
+              $downloadedAsset = Join-Path $verificationDirectory $asset.Name
+              if (-not (Test-Path -LiteralPath $downloadedAsset -PathType Leaf)) {
+                throw "GitHub did not return the expected existing asset $($asset.Name)."
+              }
+              $localHash = (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash
+              $remoteHash = (Get-FileHash -LiteralPath $downloadedAsset -Algorithm SHA256).Hash
+              if ($localHash -ne $remoteHash) {
+                throw "Existing release asset $($asset.Name) differs from the current build. Published artifacts are immutable; create a new version."
+              }
+            }
+
+            if (-not $release.isDraft) {
+              if ($missingAssets.Count -ne 0 -or $remoteNames.Count -ne $expectedNames.Count) {
+                throw "Published release $($env:TAG_NAME) does not contain the exact expected asset set. Create a new version instead of modifying it."
+              }
+              Write-Host "Published release $($env:TAG_NAME) already contains the matching immutable artifact set."
+              exit 0
+            }
+
+            if ($missingAssets.Count -gt 0) {
+              gh release upload $env:TAG_NAME $missingAssets.FullName
+              if ($LASTEXITCODE -ne 0) {
+                throw "Could not add missing assets to draft release $($env:TAG_NAME)."
+              }
+              foreach ($asset in $missingAssets) {
+                gh release download $env:TAG_NAME --pattern $asset.Name --dir $verificationDirectory
+                if ($LASTEXITCODE -ne 0) {
+                  throw "Could not download newly uploaded draft asset $($asset.Name) for verification."
+                }
+                $downloadedAsset = Join-Path $verificationDirectory $asset.Name
+                $localHash = (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash
+                $remoteHash = (Get-FileHash -LiteralPath $downloadedAsset -Algorithm SHA256).Hash
+                if ($localHash -ne $remoteHash) {
+                  throw "Newly uploaded draft asset $($asset.Name) differs from the current build."
+                }
+              }
+            }
+
+            $completedReleaseJson = gh release view $env:TAG_NAME --json isDraft,isPrerelease,assets
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not re-read draft release $($env:TAG_NAME) after verification."
+            }
+            $completedRelease = $completedReleaseJson | ConvertFrom-Json
+            $completedNames = @($completedRelease.assets.name | Sort-Object)
+            if ($completedNames.Count -ne $expectedNames.Count -or (Compare-Object $completedNames $expectedNames)) {
+              throw "Draft release $($env:TAG_NAME) does not contain the exact expected asset set."
+            }
+            gh release edit $env:TAG_NAME --draft=false
+            if ($LASTEXITCODE -ne 0) {
+              throw "Draft release $($env:TAG_NAME) was verified but could not be published."
+            }
+            Write-Host "Verified and published draft release $($env:TAG_NAME) without replacing existing assets."
+          }
+          finally {
+            Remove-Item -LiteralPath $verificationDirectory -Recurse -Force -ErrorAction SilentlyContinue
           }

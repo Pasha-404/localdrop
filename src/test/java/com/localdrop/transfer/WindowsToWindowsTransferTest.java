@@ -9,6 +9,8 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -29,6 +31,11 @@ class WindowsToWindowsTransferTest {
 
         Path sourceFile = senderDir.resolve("hello.txt");
         Files.writeString(sourceFile, "Hello from Windows");
+        Path existingFinalFile = receiverDir.resolve("hello.txt");
+        Path legacyPartialFile = receiverDir.resolve("hello.txt.localdrop-part");
+        Files.writeString(existingFinalFile, "USER ORIGINAL");
+        Files.writeString(legacyPartialFile, "USER LEGACY PARTIAL");
+        Files.setLastModifiedTime(legacyPartialFile, FileTime.from(Instant.now().minusSeconds(2 * 24 * 60 * 60)));
 
         AtomicReference<RecentlyReceivedItem> receivedItem = new AtomicReference<>();
         DiagnosticsService diagnosticsService = new DiagnosticsService(
@@ -120,12 +127,14 @@ class WindowsToWindowsTransferTest {
                 }
             );
 
-            Path receivedFile = receiverDir.resolve("hello.txt");
+            Path receivedFile = receiverDir.resolve("hello (1).txt");
             assertNull(transferIssue.get());
             assertTrue(Files.exists(receivedFile));
             assertEquals("Hello from Windows", Files.readString(receivedFile));
+            assertEquals("USER ORIGINAL", Files.readString(existingFinalFile));
+            assertEquals("USER LEGACY PARTIAL", Files.readString(legacyPartialFile));
             assertEquals(TransferStatus.SENT, item.getStatus());
-            assertEquals("hello.txt", receivedItem.get().name());
+            assertEquals("hello (1).txt", receivedItem.get().name());
         } finally {
             server.stop();
         }

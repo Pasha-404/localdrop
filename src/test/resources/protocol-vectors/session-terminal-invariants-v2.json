@@ -1,0 +1,32 @@
+{
+  "revision": "2026-09-09-r3",
+  "cases": [
+    {
+      "name": "exact-declared-totals",
+      "completedFiles": 2,
+      "fileIds": ["file-a", "file-b"],
+      "receivedBytes": 12,
+      "declaredFiles": 2,
+      "declaredTotalSize": 12,
+      "expectedErrorCode": null
+    },
+    {
+      "name": "duplicate-file-id",
+      "completedFiles": 2,
+      "fileIds": ["file-a"],
+      "receivedBytes": 12,
+      "declaredFiles": 2,
+      "declaredTotalSize": 12,
+      "expectedErrorCode": "INVALID_SESSION"
+    },
+    {
+      "name": "byte-total-mismatch",
+      "completedFiles": 2,
+      "fileIds": ["file-a", "file-b"],
+      "receivedBytes": 11,
+      "declaredFiles": 2,
+      "declaredTotalSize": 12,
+      "expectedErrorCode": "INVALID_SESSION"
+    }
+  ]
+}

@@ -8,21 +8,21 @@ import java.io.IOException;
 import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.attribute.FileTime;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Enumeration;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 
 public final class FileUtils {
+    private static final String INTERNAL_STAGING_DIRECTORY_NAME = ".localdrop-staging";
     private static final Set<String> WINDOWS_RESERVED_NAMES = Set.of(
         "CON", "PRN", "AUX", "NUL",
         "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
@@ -44,11 +44,15 @@ public final class FileUtils {
         if (!Files.isDirectory(source)) {
             return List.of();
         }
+        if (isInternalStagingDirectory(source.getFileName())) {
+            return List.of();
+        }
 
         Path rootName = Objects.requireNonNullElse(source.getFileName(), source);
         List<TransferSource> files = new ArrayList<>();
         try (var stream = Files.walk(source)) {
             stream.filter(Files::isRegularFile)
+                .filter(file -> !isInsideInternalStagingDirectory(source.relativize(file)))
                 .sorted(Comparator.naturalOrder())
                 .forEach(file -> {
                     try {
@@ -89,68 +93,34 @@ public final class FileUtils {
 
     public static Path sanitizeReceivedRelativePath(String relativePath, String fileName) throws IOException {
         validateFileName(fileName);
-        String candidate = relativePath == null || relativePath.isBlank() ? fileName : relativePath.trim();
+        String candidate = relativePath == null || relativePath.isBlank() ? fileName : relativePath;
         if (candidate.length() > ProtocolConstants.MAX_RELATIVE_PATH_LENGTH) {
             throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Relative path is too long.");
         }
-        if (candidate.indexOf('\0') >= 0 || candidate.startsWith("/") || candidate.startsWith("\\")) {
+        if (candidate.indexOf('\0') >= 0 || candidate.startsWith("/") || candidate.startsWith("\\")
+            || candidate.contains("\\") || candidate.endsWith("/")) {
             throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Relative path is not safe.");
         }
         if (candidate.matches("^[A-Za-z]:.*") || candidate.startsWith("//") || candidate.startsWith("\\\\")) {
             throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Absolute paths are not allowed.");
         }
 
-        String normalizedSeparators = candidate.replace('\\', '/');
-        Path normalized = Paths.get(normalizedSeparators).normalize();
-        if (normalized.isAbsolute() || normalized.getNameCount() == 0 || normalized.startsWith("..")) {
-            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Relative path is not safe.");
-        }
-        if (normalized.getNameCount() > ProtocolConstants.MAX_RELATIVE_PATH_DEPTH) {
+        String[] segments = candidate.split("/", -1);
+        if (segments.length > ProtocolConstants.MAX_RELATIVE_PATH_DEPTH) {
             throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Relative path is too deep.");
         }
 
-        Set<String> seenSegments = new HashSet<>();
-        for (Path segmentPath : normalized) {
-            String segment = segmentPath.toString();
+        for (String segment : segments) {
             validatePathSegment(segment);
-            seenSegments.add(segment);
         }
-        if (seenSegments.isEmpty()) {
-            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Relative path is empty.");
+        if (!segments[segments.length - 1].equals(fileName)) {
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Relative path leaf does not match file name.");
         }
-        return normalized;
-    }
-
-    public static void cleanupPartialFiles(Path root, long olderThanMillis) {
-        if (root == null) {
-            return;
-        }
-
-        Instant cutoff = Instant.now().minusMillis(Math.max(0, olderThanMillis));
-        try {
-            if (!Files.exists(root) || !Files.isDirectory(root)) {
-                return;
-            }
-            try (var stream = Files.walk(root)) {
-                stream.filter(Files::isRegularFile)
-                    .filter(path -> path.getFileName().toString().endsWith(".localdrop-part"))
-                    .forEach(path -> {
-                        try {
-                            if (Files.getLastModifiedTime(path).toInstant().isBefore(cutoff)) {
-                                Files.deleteIfExists(path);
-                            }
-                        } catch (IOException ignored) {
-                            // Cleanup is best-effort only.
-                        }
-                    });
-            }
-        } catch (IOException ignored) {
-            // Cleanup is best-effort only.
-        }
+        return Paths.get(String.join(java.io.File.separator, segments));
     }
 
     public static Path ensureUniqueFile(Path target) {
-        if (!Files.exists(target)) {
+        if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
             return target;
         }
 
@@ -169,18 +139,10 @@ public final class FileUtils {
         int suffix = 1;
         while (true) {
             Path candidate = parent.resolve("%s (%d)%s".formatted(baseName, suffix, extension));
-            if (!Files.exists(candidate)) {
+            if (!Files.exists(candidate, LinkOption.NOFOLLOW_LINKS)) {
                 return candidate;
             }
             suffix++;
-        }
-    }
-
-    public static void moveAtomicallyOrReplace(Path source, Path target) throws IOException {
-        try {
-            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE);
-        } catch (IOException ignored) {
-            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
         }
     }
 
@@ -220,6 +182,19 @@ public final class FileUtils {
             Files.size(absolutePath),
             Files.getLastModifiedTime(absolutePath).toMillis()
         );
+    }
+
+    private static boolean isInsideInternalStagingDirectory(Path relativePath) {
+        for (Path segment : relativePath) {
+            if (isInternalStagingDirectory(segment)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isInternalStagingDirectory(Path path) {
+        return path != null && INTERNAL_STAGING_DIRECTORY_NAME.equalsIgnoreCase(path.toString());
     }
 
     private static void validateFileName(String fileName) throws IOException {

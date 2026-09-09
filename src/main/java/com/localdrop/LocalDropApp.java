@@ -21,8 +21,10 @@ public class LocalDropApp extends Application {
     private static volatile SingleInstanceService singleInstanceService;
     private final AtomicBoolean exitRequested = new AtomicBoolean(false);
     private final Logger logger = LogService.getLogger(LocalDropApp.class);
+    private ConfigService configService;
     private MainController controller;
     private TrayService trayService;
+    private WindowLayout.WindowStateTracker windowStateTracker;
     private boolean movingToTray;
 
     @Override
@@ -30,19 +32,14 @@ public class LocalDropApp extends Application {
         try {
             LogService.initialize();
 
-            ConfigService configService = new ConfigService();
+            configService = new ConfigService();
             AppConfig config = configService.load();
             LogService.initialize(config.getLogLevel());
 
             controller = new MainController(configService, config, ConfigService.resolveDeviceName());
             controller.attachStage(primaryStage);
 
-            WindowLayout.FittedBounds initialWindowBounds = WindowLayout.fitToPrimaryScreen(
-                config.getWindowWidth(),
-                config.getWindowHeight(),
-                960,
-                480
-            );
+            WindowLayout.FittedBounds initialWindowBounds = WindowLayout.fitForApplication(config);
             Scene scene = new Scene(controller.getRoot(), initialWindowBounds.width(), initialWindowBounds.height());
             scene.getStylesheets().add(Objects.requireNonNull(
                 LocalDropApp.class.getResource("/com/localdrop/styles.css")
@@ -54,6 +51,7 @@ public class LocalDropApp extends Application {
             )));
             primaryStage.setScene(scene);
             WindowLayout.apply(primaryStage, initialWindowBounds);
+            windowStateTracker = WindowLayout.trackNormalBounds(primaryStage, initialWindowBounds);
 
             Platform.setImplicitExit(false);
             configureTray(primaryStage);
@@ -64,6 +62,9 @@ public class LocalDropApp extends Application {
             }
 
             primaryStage.show();
+            if (config.isWindowMaximized()) {
+                primaryStage.setMaximized(true);
+            }
             controller.startServicesAsync();
             logger.info("Application window shown; background services starting");
         } catch (Throwable throwable) {
@@ -98,6 +99,9 @@ public class LocalDropApp extends Application {
             if (trayService != null && trayService.isInstalled() && !exitRequested.get()) {
                 event.consume();
                 stage.hide();
+            } else if (!exitRequested.get()) {
+                event.consume();
+                requestExit();
             }
         });
 
@@ -126,6 +130,7 @@ public class LocalDropApp extends Application {
         }
 
         try {
+            persistWindowState();
             if (controller != null) {
                 controller.shutdown();
             }
@@ -139,6 +144,24 @@ public class LocalDropApp extends Application {
             }
             LogService.shutdown();
             Platform.exit();
+        }
+    }
+
+    private void persistWindowState() {
+        if (configService == null || windowStateTracker == null) {
+            return;
+        }
+        WindowLayout.WindowState state = windowStateTracker.snapshot();
+        try {
+            configService.updateWindowState(
+                state.x(),
+                state.y(),
+                state.width(),
+                state.height(),
+                state.maximized()
+            );
+        } catch (Exception exception) {
+            logger.warning("Failed to persist window state: " + exception.getMessage());
         }
     }
 

@@ -36,18 +36,45 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 
 public class MainController {
+    private static final int MAX_SERVICE_STARTUP_RECOVERY_ATTEMPTS = 3;
+
     private enum ReceiveActivity {
         READY,
         UNAVAILABLE,
         RECEIVING_FROM,
         LAST_RECEIVED
+    }
+
+    private enum ReceiveAvailability {
+        STARTING,
+        READY,
+        BUSY,
+        UNAVAILABLE
+    }
+
+    private enum DiscoveryAvailability {
+        STARTING,
+        RUNNING,
+        UNAVAILABLE
+    }
+
+    private static final class ActiveTransferBatch {
+        private final String id = UUID.randomUUID().toString();
+        private final List<TransferQueueItem> items;
+
+        private ActiveTransferBatch(List<TransferQueueItem> items) {
+            this.items = List.copyOf(items);
+        }
     }
 
     private final Logger logger = LogService.getLogger(MainController.class);
@@ -65,6 +92,8 @@ public class MainController {
     });
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
     private final AtomicBoolean serviceStartupScheduled = new AtomicBoolean(false);
+    private final AtomicInteger serviceStartupRecoveryAttempts = new AtomicInteger();
+    private final AtomicLong receiveAvailabilityRevision = new AtomicLong();
     private final Object serviceLifecycleLock = new Object();
     private final I18n i18n;
     private final MainView view = new MainView(devices, queueItems, recentItems);
@@ -76,8 +105,12 @@ public class MainController {
     private volatile DiscoveryService discoveryService;
     private List<DeviceInfo> latestDiscoverySnapshot = List.of();
     private volatile boolean transferInProgress;
+    private ActiveTransferBatch activeTransferBatch;
     private ReceiveActivity receiveActivity = ReceiveActivity.READY;
     private String receiveActivityArgument;
+    private ReceiveAvailability receiveAvailability = ReceiveAvailability.STARTING;
+    private volatile ReceiveAvailability lastReportedReceiveAvailability = ReceiveAvailability.STARTING;
+    private DiscoveryAvailability discoveryAvailability = DiscoveryAvailability.STARTING;
 
     public MainController(ConfigService configService, AppConfig config, String deviceName) {
         this.configService = configService;
@@ -99,8 +132,10 @@ public class MainController {
         view.setLanguageSelection(i18n.getLanguage());
         view.updateCurrentDeviceName(deviceName);
         view.updateReceiveFolder(configService.getReceiveFolder());
-        view.updateNetworkLabel(FileUtils.detectNetworkName());
+        view.updateNetworkLabel(i18n.text("status.localNetwork"));
         updateReceiveActivityLabel();
+        renderReceiveAvailability();
+        renderDiscoveryAvailability();
     }
 
     /** Starts local network listeners without delaying the JavaFX application thread. */
@@ -109,9 +144,25 @@ public class MainController {
             return;
         }
 
+        runOnUiThread(() -> {
+            if (transferServer == null || !transferServer.isRunning()) {
+                setReceiveAvailability(ReceiveAvailability.STARTING);
+            }
+            if (discoveryService == null || !discoveryService.isRunning()) {
+                setDiscoveryAvailability(DiscoveryAvailability.STARTING);
+            }
+        });
+
         try {
-            backgroundExecutor.submit(this::startServices);
+            backgroundExecutor.submit(() -> {
+                try {
+                    startServices();
+                } finally {
+                    serviceStartupScheduled.set(false);
+                }
+            });
         } catch (RejectedExecutionException ignored) {
+            serviceStartupScheduled.set(false);
             // Shutdown won the race before the background task was accepted.
         }
     }
@@ -121,12 +172,15 @@ public class MainController {
             return;
         }
 
-        TransferServer candidateTransferServer = new TransferServer(
-            configService::getReceiveFolder,
-            config.getDeviceId(),
-            deviceName,
-            ProtocolConstants.DEVICE_TYPE_WINDOWS,
-            new TransferServer.Listener() {
+        TransferServer activeTransferServer = transferServer;
+        boolean receiveAvailable = activeTransferServer != null && activeTransferServer.isRunning();
+        if (!receiveAvailable) {
+            TransferServer candidateTransferServer = new TransferServer(
+                configService::getReceiveFolder,
+                config.getDeviceId(),
+                deviceName,
+                ProtocolConstants.DEVICE_TYPE_WINDOWS,
+                new TransferServer.Listener() {
             @Override
             public void onReceiveCompleted(RecentlyReceivedItem item) {
                 Platform.runLater(() -> {
@@ -143,6 +197,7 @@ public class MainController {
             public void onReadyToReceive() {
                 Platform.runLater(() -> {
                     setReceiveActivity(ReceiveActivity.READY, null);
+                    refreshReceiveAvailabilityAsync();
                     if (discoveryService != null) {
                         discoveryService.refreshNow();
                     }
@@ -153,29 +208,36 @@ public class MainController {
             public void onReceivingFrom(String senderDeviceName) {
                 Platform.runLater(() -> {
                     setReceiveActivity(ReceiveActivity.RECEIVING_FROM, senderDeviceName);
+                    setReceiveAvailability(ReceiveAvailability.BUSY);
                     if (discoveryService != null) {
                         discoveryService.refreshNow();
                     }
                 });
             }
-        }, diagnosticsService);
+                }, diagnosticsService);
 
-        boolean receiveAvailable = false;
-        try {
-            candidateTransferServer.start();
-            receiveAvailable = true;
-            if (!registerTransferServer(candidateTransferServer)) {
+            try {
+                candidateTransferServer.start();
+                if (!registerTransferServer(candidateTransferServer)) {
+                    candidateTransferServer.stop();
+                    return;
+                }
+                activeTransferServer = candidateTransferServer;
+                receiveAvailable = true;
+                runOnUiThread(() -> {
+                    setReceiveActivity(ReceiveActivity.READY, null);
+                    refreshReceiveAvailabilityAsync();
+                });
+            } catch (IOException exception) {
                 candidateTransferServer.stop();
-                return;
+                logger.severe("Unable to start receive service: " + exception.getMessage());
+                diagnosticsService.setTransferServerStatus("ERROR", ProtocolConstants.ERROR_TRANSFER_PORT_UNAVAILABLE);
+                runOnUiThread(() -> {
+                    setReceiveActivity(ReceiveActivity.UNAVAILABLE, null);
+                    setReceiveAvailability(ReceiveAvailability.UNAVAILABLE);
+                    view.updateInlineError(i18n.format("errors.receiveService", exception.getMessage()));
+                });
             }
-            runOnUiThread(() -> setReceiveActivity(ReceiveActivity.READY, null));
-        } catch (IOException exception) {
-            logger.severe("Unable to start receive service: " + exception.getMessage());
-            diagnosticsService.setTransferServerStatus("ERROR", ProtocolConstants.ERROR_TRANSFER_PORT_UNAVAILABLE);
-            runOnUiThread(() -> {
-                setReceiveActivity(ReceiveActivity.UNAVAILABLE, null);
-                view.updateInlineError(i18n.format("errors.receiveService", exception.getMessage()));
-            });
         }
 
         if (shutdown.get()) {
@@ -183,27 +245,50 @@ public class MainController {
         }
 
         int advertisedTransferPort = receiveAvailable
-            ? candidateTransferServer.getBoundPort()
+            ? activeTransferServer.getBoundPort()
             : ProtocolConstants.DEFAULT_TRANSFER_PORT;
-        DiscoveryService candidateDiscoveryService = new DiscoveryService(
-            config.getDeviceId(),
-            deviceName,
-            ProtocolConstants.DEVICE_TYPE_WINDOWS,
-            advertisedTransferPort,
-            this::resolveLocalDiscoveryStatus,
-            snapshot -> Platform.runLater(() -> applyDeviceSnapshot(snapshot)),
-            diagnosticsService
-        );
+        DiscoveryService activeDiscoveryService = discoveryService;
+        boolean discoveryAvailable = activeDiscoveryService != null && activeDiscoveryService.isRunning();
+        if (discoveryAvailable) {
+            activeDiscoveryService.updateTransferPort(advertisedTransferPort);
+            activeDiscoveryService.retryRecovery();
+        } else {
+            DiscoveryService candidateDiscoveryService = new DiscoveryService(
+                config.getDeviceId(),
+                deviceName,
+                ProtocolConstants.DEVICE_TYPE_WINDOWS,
+                advertisedTransferPort,
+                this::resolveLocalDiscoveryStatus,
+                snapshot -> Platform.runLater(() -> applyDeviceSnapshot(snapshot)),
+                diagnosticsService
+            );
 
-        try {
-            candidateDiscoveryService.start();
-            if (!registerDiscoveryService(candidateDiscoveryService)) {
+            try {
+                candidateDiscoveryService.start();
+                if (!registerDiscoveryService(candidateDiscoveryService)) {
+                    candidateDiscoveryService.stop();
+                    return;
+                }
+                activeDiscoveryService = candidateDiscoveryService;
+                discoveryAvailable = true;
+            } catch (IOException exception) {
                 candidateDiscoveryService.stop();
+                logger.severe("Unable to start device discovery: " + exception.getMessage());
+                diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
+                runOnUiThread(() -> {
+                    setDiscoveryAvailability(DiscoveryAvailability.UNAVAILABLE);
+                    view.updateInlineError(i18n.format("errors.discoveryService", exception.getMessage()));
+                });
             }
-        } catch (IOException exception) {
-            logger.severe("Unable to start device discovery: " + exception.getMessage());
-            diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
-            runOnUiThread(() -> view.updateInlineError(i18n.format("errors.discoveryService", exception.getMessage())));
+        }
+
+        if (discoveryAvailable) {
+            runOnUiThread(() -> setDiscoveryAvailability(DiscoveryAvailability.RUNNING));
+        }
+        if (receiveAvailable && discoveryAvailable) {
+            serviceStartupRecoveryAttempts.set(0);
+        } else {
+            scheduleServiceStartupRecovery();
         }
     }
 
@@ -227,6 +312,43 @@ public class MainController {
         }
     }
 
+    private void refreshNetworkServices() {
+        DiscoveryService activeDiscoveryService = discoveryService;
+        if (activeDiscoveryService != null) {
+            activeDiscoveryService.refreshNow();
+        }
+        if (transferServer == null || !transferServer.isRunning()
+            || activeDiscoveryService == null || !activeDiscoveryService.isRunning()) {
+            serviceStartupRecoveryAttempts.set(0);
+            startServicesAsync();
+        }
+    }
+
+    private void scheduleServiceStartupRecovery() {
+        int attempt = serviceStartupRecoveryAttempts.incrementAndGet();
+        if (attempt > MAX_SERVICE_STARTUP_RECOVERY_ATTEMPTS) {
+            logger.warning("Local service startup recovery was exhausted; Refresh can retry it manually.");
+            return;
+        }
+
+        long delayMillis = 500L * attempt;
+        try {
+            backgroundExecutor.submit(() -> {
+                try {
+                    Thread.sleep(delayMillis);
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (!shutdown.get()) {
+                    startServicesAsync();
+                }
+            });
+        } catch (RejectedExecutionException ignored) {
+            // Shutdown won the race before a bounded retry could be scheduled.
+        }
+    }
+
     private void runOnUiThread(Runnable action) {
         Platform.runLater(() -> {
             if (!shutdown.get()) {
@@ -238,14 +360,6 @@ public class MainController {
     public void shutdown() {
         if (!shutdown.compareAndSet(false, true)) {
             return;
-        }
-
-        try {
-            if (stage != null) {
-                configService.updateWindowSize(stage.getWidth(), stage.getHeight());
-            }
-        } catch (IOException exception) {
-            logger.warning("Failed to persist window size: " + exception.getMessage());
         }
 
         DiscoveryService discoveryServiceToStop;
@@ -269,19 +383,13 @@ public class MainController {
         view.setRemoveQueueItemAction(this::removeQueueItem);
 
         view.getRefreshButton().setOnAction(event -> {
-            if (discoveryService != null) {
-                discoveryService.refreshNow();
-            }
+            refreshNetworkServices();
         });
         view.getDiagnosticsButton().setOnAction(event -> Dialogs.showDiagnostics(
             stage,
             i18n,
             () -> diagnosticsService.formatSnapshot(i18n),
-            () -> {
-                if (discoveryService != null) {
-                    discoveryService.refreshNow();
-                }
-            }
+            this::refreshNetworkServices
         ));
         view.getAddFilesButton().setOnAction(event -> chooseFiles());
         view.getAddFolderButton().setOnAction(event -> chooseFolder());
@@ -396,9 +504,7 @@ public class MainController {
     private void sendQueue() {
         DeviceInfo selectedDevice = view.getDeviceListView().getSelectionModel().getSelectedItem();
         List<TransferQueueItem> pendingItems = queueItems.stream()
-            .filter(item -> item.getStatus() == TransferStatus.QUEUED
-                || item.getStatus() == TransferStatus.FAILED
-                || item.getStatus() == TransferStatus.WAITING_FOR_RETRY)
+            .filter(TransferQueueItem::isEligibleForNewTransfer)
             .toList();
 
         if (selectedDevice == null || pendingItems.isEmpty() || transferInProgress) {
@@ -414,77 +520,109 @@ public class MainController {
             return;
         }
 
+        ActiveTransferBatch batch = reserveTransferBatch(pendingItems);
+        if (batch == null) {
+            return;
+        }
         transferInProgress = true;
         view.updateInlineError("");
         updateSendButtonState();
 
-        backgroundExecutor.submit(() -> transferClient.sendFiles(
-            resolution.device(),
-            config.getDeviceId(),
-            deviceName,
-            ProtocolConstants.DEVICE_TYPE_WINDOWS,
-            pendingItems,
-            new TransferClient.Listener() {
-                private final ProgressUpdateThrottle progressThrottle = new ProgressUpdateThrottle();
+        try {
+            backgroundExecutor.submit(() -> transferClient.sendFiles(
+                resolution.device(),
+                config.getDeviceId(),
+                deviceName,
+                ProtocolConstants.DEVICE_TYPE_WINDOWS,
+                pendingItems,
+                new TransferClient.Listener() {
+                    private final ProgressUpdateThrottle progressThrottle = new ProgressUpdateThrottle();
 
-                @Override
-                public void onItemStatusChanged(TransferQueueItem item, TransferStatus status, String message) {
-                    if (status == TransferStatus.SENDING) {
-                        progressThrottle.reset();
-                    }
-                    Platform.runLater(() -> {
-                        item.setStatus(status);
-                        item.setMessage(message == null ? "" : message);
-                        if (status != TransferStatus.SENDING) {
-                            item.setProgress(0);
+                    @Override
+                    public void onItemStatusChanged(TransferQueueItem item, TransferStatus status, String message) {
+                        if (status == TransferStatus.SENDING) {
+                            progressThrottle.reset();
                         }
-                        view.refreshQueue();
-                    });
-                }
-
-                @Override
-                public void onItemProgress(TransferQueueItem item, double progress) {
-                    if (!progressThrottle.shouldPublish(progress)) {
-                        return;
+                        Platform.runLater(() -> {
+                            if (!isCurrentBatchItem(batch, item)) {
+                                return;
+                            }
+                            item.setStatus(status);
+                            item.setMessage(message == null ? "" : message);
+                            if (status != TransferStatus.SENDING) {
+                                item.setProgress(0);
+                            }
+                            view.refreshQueue();
+                        });
                     }
-                    Platform.runLater(() -> {
-                        item.setStatus(TransferStatus.SENDING);
-                        item.setMessage("");
-                        item.setProgress(progress);
-                        view.refreshQueue();
-                    });
-                }
 
-                @Override
-                public void onItemAcknowledged(TransferQueueItem item) {
-                    Platform.runLater(() -> queueItems.remove(item));
-                }
+                    @Override
+                    public void onItemProgress(TransferQueueItem item, double progress) {
+                        if (!progressThrottle.shouldPublish(progress)) {
+                            return;
+                        }
+                        Platform.runLater(() -> {
+                            if (isCurrentBatchItem(batch, item) && item.updateProgressIfSending(progress)) {
+                                view.refreshQueue();
+                            }
+                        });
+                    }
 
-                @Override
-                public void onTransferIssue(String targetDeviceName, String details) {
-                    Platform.runLater(() -> view.updateInlineError(i18n.format("errors.sendTo", targetDeviceName, details)));
-                }
+                    @Override
+                    public void onItemAcknowledged(TransferQueueItem item) {
+                        Platform.runLater(() -> {
+                            if (!isCurrentBatchItem(batch, item)) {
+                                return;
+                            }
+                            item.release(batch.id);
+                            queueItems.remove(item);
+                            view.refreshQueue();
+                        });
+                    }
 
-                @Override
-                public void onReceiverRejected(String reason) {
-                    Platform.runLater(() -> view.updateInlineError(
-                        reason == null || reason.isBlank() ? i18n.text("errors.receiverRejected") : reason
-                    ));
-                }
+                    @Override
+                    public void onTransferIssue(String targetDeviceName, String details) {
+                        Platform.runLater(() -> {
+                            if (activeTransferBatch == batch) {
+                                view.updateInlineError(i18n.format("errors.sendTo", targetDeviceName, details));
+                            }
+                        });
+                    }
 
-                @Override
-                public void onTransferFinished() {
-                    Platform.runLater(() -> {
-                        transferInProgress = false;
-                        updateSendButtonState();
-                    });
+                    @Override
+                    public void onReceiverRejected(String reason) {
+                        Platform.runLater(() -> {
+                            if (activeTransferBatch == batch) {
+                                view.updateInlineError(
+                                    reason == null || reason.isBlank() ? i18n.text("errors.receiverRejected") : reason
+                                );
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onSessionFinishUnconfirmed(String targetDeviceName, String details) {
+                        Platform.runLater(() -> {
+                            if (activeTransferBatch == batch) {
+                                view.updateInlineError(i18n.format("errors.sessionFinishUnconfirmed", targetDeviceName));
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onTransferFinished() {
+                        Platform.runLater(() -> finishTransferBatch(batch));
+                    }
                 }
-            }
-        ));
+            ));
+        } catch (RejectedExecutionException exception) {
+            releaseUnstartedTransferBatch(batch);
+            view.updateInlineError(i18n.text("errors.sendUnavailable"));
+        }
     }
 
     private void clearQueue() {
-        queueItems.removeIf(item -> item.getStatus() != TransferStatus.SENDING);
+        queueItems.removeIf(TransferQueueItem::canRemove);
         updateSendButtonState();
     }
 
@@ -511,6 +649,7 @@ public class MainController {
             configService.updateReceiveFolder(folder.toPath().toAbsolutePath().normalize());
             view.updateReceiveFolder(configService.getReceiveFolder());
             view.updateInlineError("");
+            refreshReceiveAvailabilityAsync();
             if (discoveryService != null) {
                 discoveryService.refreshNow();
             }
@@ -629,18 +768,23 @@ public class MainController {
     }
 
     private void changeLanguage(AppLanguage language) {
-        i18n.setLanguage(language);
-        config.setLanguage(language.getCode());
-        view.setI18n(i18n);
-        view.setLanguageSelection(language);
-        updateReceiveActivityLabel();
-        updateSendButtonState();
-
+        AppLanguage previousLanguage = i18n.getLanguage();
         try {
             configService.updateLanguage(language);
         } catch (IOException exception) {
             logger.warning("Failed to save language preference: " + exception.getMessage());
+            view.setLanguageSelection(previousLanguage);
+            return;
         }
+
+        i18n.setLanguage(language);
+        view.setI18n(i18n);
+        view.setLanguageSelection(language);
+        view.updateNetworkLabel(i18n.text("status.localNetwork"));
+        updateReceiveActivityLabel();
+        renderReceiveAvailability();
+        renderDiscoveryAvailability();
+        updateSendButtonState();
     }
 
     private void setReceiveActivity(ReceiveActivity activity, String argument) {
@@ -659,12 +803,75 @@ public class MainController {
         view.updateReceivingActivity(message);
     }
 
+    private void refreshReceiveAvailabilityAsync() {
+        try {
+            backgroundExecutor.submit(this::resolveLocalDiscoveryStatus);
+        } catch (RejectedExecutionException ignored) {
+            // Shutdown won the race before the availability check was accepted.
+        }
+    }
+
+    private ReceiveAvailability mapReceiveAvailability(String status) {
+        if (ProtocolConstants.STATUS_BUSY.equalsIgnoreCase(status)) {
+            return ReceiveAvailability.BUSY;
+        }
+        if (ProtocolConstants.STATUS_READY.equalsIgnoreCase(status)
+            || ProtocolConstants.STATUS_READY_COMPAT.equalsIgnoreCase(status)) {
+            return ReceiveAvailability.READY;
+        }
+        return ReceiveAvailability.UNAVAILABLE;
+    }
+
+    private void setReceiveAvailability(ReceiveAvailability availability) {
+        receiveAvailabilityRevision.incrementAndGet();
+        lastReportedReceiveAvailability = availability;
+        receiveAvailability = availability;
+        renderReceiveAvailability();
+    }
+
+    private void renderReceiveAvailability() {
+        switch (receiveAvailability) {
+            case STARTING -> view.updateReceiveAvailability(
+                i18n.text("receiving.availability.starting"),
+                i18n.text("receiving.chip.starting"),
+                "starting"
+            );
+            case READY -> view.updateReceiveAvailability(
+                i18n.text("receiving.availability.ready"),
+                i18n.text("receiving.chip.ready"),
+                "ready"
+            );
+            case BUSY -> view.updateReceiveAvailability(
+                i18n.text("receiving.availability.busy"),
+                i18n.text("receiving.chip.busy"),
+                "busy"
+            );
+            case UNAVAILABLE -> view.updateReceiveAvailability(
+                i18n.text("receiving.availability.unavailable"),
+                i18n.text("receiving.chip.unavailable"),
+                "unavailable"
+            );
+        }
+    }
+
+    private void setDiscoveryAvailability(DiscoveryAvailability availability) {
+        discoveryAvailability = availability;
+        renderDiscoveryAvailability();
+    }
+
+    private void renderDiscoveryAvailability() {
+        String message = switch (discoveryAvailability) {
+            case STARTING -> i18n.text("status.discoveryStarting");
+            case RUNNING -> i18n.text("status.discoveryEnabled");
+            case UNAVAILABLE -> i18n.text("status.discoveryUnavailable");
+        };
+        view.updateDiscoveryStatus(message);
+    }
+
     private void updateSendButtonState() {
         DeviceInfo selectedDevice = view.getDeviceListView().getSelectionModel().getSelectedItem();
         long pendingCount = queueItems.stream()
-            .filter(item -> item.getStatus() == TransferStatus.QUEUED
-                || item.getStatus() == TransferStatus.FAILED
-                || item.getStatus() == TransferStatus.WAITING_FOR_RETRY)
+            .filter(TransferQueueItem::isEligibleForNewTransfer)
             .count();
 
         String buttonText;
@@ -683,27 +890,103 @@ public class MainController {
         view.updateSendButton(buttonText, disabled);
     }
 
+    private ActiveTransferBatch reserveTransferBatch(List<TransferQueueItem> items) {
+        if (activeTransferBatch != null) {
+            return null;
+        }
+        ActiveTransferBatch batch = new ActiveTransferBatch(items);
+        for (TransferQueueItem item : batch.items) {
+            if (!item.reserve(batch.id)) {
+                for (TransferQueueItem reservedItem : batch.items) {
+                    reservedItem.release(batch.id);
+                }
+                return null;
+            }
+        }
+        activeTransferBatch = batch;
+        view.refreshQueue();
+        return batch;
+    }
+
+    private boolean isCurrentBatchItem(ActiveTransferBatch batch, TransferQueueItem item) {
+        return activeTransferBatch == batch
+            && batch.items.contains(item)
+            && queueItems.contains(item)
+            && item.isReservedBy(batch.id);
+    }
+
+    private void releaseUnstartedTransferBatch(ActiveTransferBatch batch) {
+        if (activeTransferBatch != batch) {
+            return;
+        }
+        for (TransferQueueItem item : batch.items) {
+            item.release(batch.id);
+        }
+        activeTransferBatch = null;
+        transferInProgress = false;
+        view.refreshQueue();
+        updateSendButtonState();
+    }
+
+    private void finishTransferBatch(ActiveTransferBatch batch) {
+        if (activeTransferBatch != batch) {
+            return;
+        }
+        for (TransferQueueItem item : batch.items) {
+            if (!item.isReservedBy(batch.id)) {
+                continue;
+            }
+            if (item.getStatus() == TransferStatus.SENDING) {
+                item.setStatus(TransferStatus.DELIVERY_UNKNOWN);
+                item.setMessage("");
+                item.setProgress(0);
+            }
+            item.release(batch.id);
+        }
+        activeTransferBatch = null;
+        transferInProgress = false;
+        view.refreshQueue();
+        updateSendButtonState();
+    }
+
     private String resolveLocalDiscoveryStatus() {
+        String status;
         if (transferServer == null || !transferServer.isRunning()) {
-            return ProtocolConstants.STATUS_TRANSFER_PORT_UNAVAILABLE;
+            status = ProtocolConstants.STATUS_TRANSFER_PORT_UNAVAILABLE;
+        } else if (transferServer.isBusy()) {
+            status = ProtocolConstants.STATUS_BUSY;
+        } else {
+            Path receiveFolder = configService.getReceiveFolder();
+            if (receiveFolder == null) {
+                status = ProtocolConstants.STATUS_RECEIVE_FOLDER_NOT_SELECTED;
+            } else {
+                try {
+                    Files.createDirectories(receiveFolder);
+                    status = Files.isWritable(receiveFolder)
+                        ? ProtocolConstants.STATUS_READY
+                        : ProtocolConstants.STATUS_RECEIVE_FOLDER_NOT_WRITABLE;
+                } catch (IOException exception) {
+                    status = ProtocolConstants.STATUS_RECEIVE_FOLDER_NOT_WRITABLE;
+                }
+            }
         }
-        if (transferServer.isBusy()) {
-            return ProtocolConstants.STATUS_BUSY;
-        }
+        publishReceiveAvailability(status);
+        return status;
+    }
 
-        Path receiveFolder = configService.getReceiveFolder();
-        if (receiveFolder == null) {
-            return ProtocolConstants.STATUS_RECEIVE_FOLDER_NOT_SELECTED;
+    private void publishReceiveAvailability(String status) {
+        ReceiveAvailability nextAvailability = mapReceiveAvailability(status);
+        if (lastReportedReceiveAvailability == nextAvailability) {
+            return;
         }
-
-        try {
-            Files.createDirectories(receiveFolder);
-            return Files.isWritable(receiveFolder)
-                ? ProtocolConstants.STATUS_READY
-                : ProtocolConstants.STATUS_RECEIVE_FOLDER_NOT_WRITABLE;
-        } catch (IOException exception) {
-            return ProtocolConstants.STATUS_RECEIVE_FOLDER_NOT_WRITABLE;
-        }
+        lastReportedReceiveAvailability = nextAvailability;
+        long revision = receiveAvailabilityRevision.incrementAndGet();
+        runOnUiThread(() -> {
+            if (receiveAvailabilityRevision.get() == revision) {
+                receiveAvailability = nextAvailability;
+                renderReceiveAvailability();
+            }
+        });
     }
 
     private void scheduleDeviceListReevaluation(long delayMillis) {

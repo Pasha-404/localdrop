@@ -1,0 +1,15 @@
+{
+  "type": "FILE_ACK",
+  "protocolVersion": 2,
+  "messageId": "golden-message-ack-error-001",
+  "sessionId": "golden-session-001",
+  "fileId": "golden-file-001",
+  "deviceId": "golden-device-windows",
+  "deviceName": "Golden Receiver",
+  "deviceType": "WINDOWS",
+  "status": "OK",
+  "success": true,
+  "checksumOk": true,
+  "errorCode": "FILE_WRITE_ERROR",
+  "timestamp": 1710000000001
+}

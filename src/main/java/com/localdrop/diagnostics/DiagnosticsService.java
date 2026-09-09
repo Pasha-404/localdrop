@@ -3,6 +3,7 @@ package com.localdrop.diagnostics;
 import com.localdrop.i18n.I18n;
 import com.localdrop.protocol.ProtocolConstants;
 import com.localdrop.protocol.discovery.DeviceInfo;
+import com.localdrop.util.BuildInfo;
 import com.localdrop.util.LogService;
 
 import java.net.InetAddress;
@@ -574,6 +575,6 @@ public class DiagnosticsService {
 
     private static String applicationVersion() {
         String implementationVersion = DiagnosticsService.class.getPackage().getImplementationVersion();
-        return implementationVersion == null || implementationVersion.isBlank() ? "2.2.1" : implementationVersion;
+        return implementationVersion == null || implementationVersion.isBlank() ? BuildInfo.version() : implementationVersion;
     }
 }

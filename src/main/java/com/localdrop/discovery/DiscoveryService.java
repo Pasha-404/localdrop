@@ -29,13 +29,19 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.logging.Logger;
 
 public class DiscoveryService {
+    private static final int MAX_SOCKET_RECOVERY_ATTEMPTS = 5;
+    private static final long INITIAL_SOCKET_RECOVERY_DELAY_MILLIS = 250;
+    private static final long MAX_SOCKET_RECOVERY_DELAY_MILLIS = 4_000;
+
     public record SendTargetResolution(DeviceInfo device, String errorCode, String message) {
         public boolean canSend() {
             return device != null && errorCode == null;
@@ -53,10 +59,12 @@ public class DiscoveryService {
     private final String deviceId;
     private final String deviceName;
     private final String deviceType;
-    private final int tcpPort;
+    private final int discoveryPort;
+    private final AtomicBoolean socketRecoveryScheduled = new AtomicBoolean(false);
 
     private volatile boolean running;
-    private DatagramSocket socket;
+    private volatile int tcpPort;
+    private volatile DatagramSocket socket;
 
     public DiscoveryService(
         String deviceId,
@@ -67,25 +75,44 @@ public class DiscoveryService {
         Consumer<List<DeviceInfo>> devicesChangedCallback,
         DiagnosticsService diagnosticsService
     ) {
+        this(
+            deviceId,
+            deviceName,
+            deviceType,
+            tcpPort,
+            ProtocolConstants.DISCOVERY_PORT,
+            localStatusSupplier,
+            devicesChangedCallback,
+            diagnosticsService
+        );
+    }
+
+    DiscoveryService(
+        String deviceId,
+        String deviceName,
+        String deviceType,
+        int tcpPort,
+        int discoveryPort,
+        Supplier<String> localStatusSupplier,
+        Consumer<List<DeviceInfo>> devicesChangedCallback,
+        DiagnosticsService diagnosticsService
+    ) {
         this.deviceId = deviceId;
         this.deviceName = deviceName;
         this.deviceType = deviceType;
         this.tcpPort = tcpPort;
+        this.discoveryPort = discoveryPort;
         this.localStatusSupplier = localStatusSupplier;
         this.devicesChangedCallback = devicesChangedCallback;
         this.diagnosticsService = diagnosticsService;
     }
 
-    public void start() throws IOException {
+    public synchronized void start() throws IOException {
         if (running) {
             return;
         }
 
-        socket = new DatagramSocket(null);
-        socket.setReuseAddress(true);
-        socket.bind(new InetSocketAddress(ProtocolConstants.DISCOVERY_PORT));
-        socket.setBroadcast(true);
-        socket.setSoTimeout(1000);
+        socket = openSocket();
 
         running = true;
         diagnosticsService.refreshNetworkSnapshot();
@@ -106,21 +133,27 @@ public class DiscoveryService {
         scheduler.scheduleAtFixedRate(this::safeBroadcast, 0, ProtocolConstants.DISCOVERY_BROADCAST_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
         scheduler.scheduleAtFixedRate(this::pruneExpiredDevices, 1, 1, TimeUnit.SECONDS);
 
-        logger.info("UDP discovery v2-open started on port " + ProtocolConstants.DISCOVERY_PORT);
+        logger.info("UDP discovery v2-open started on port " + discoveryPort);
     }
 
     public void refreshNow() {
-        scheduler.execute(this::pruneExpiredDevices);
-        for (int index = 0; index < ProtocolConstants.MANUAL_REFRESH_BURST_COUNT; index++) {
-            scheduler.schedule(this::safeBroadcast, index * ProtocolConstants.MANUAL_REFRESH_BURST_DELAY_MS, TimeUnit.MILLISECONDS);
+        if (!running) {
+            return;
+        }
+        retryRecovery();
+        try {
+            scheduler.execute(this::pruneExpiredDevices);
+            for (int index = 0; index < ProtocolConstants.MANUAL_REFRESH_BURST_COUNT; index++) {
+                scheduler.schedule(this::safeBroadcast, index * ProtocolConstants.MANUAL_REFRESH_BURST_DELAY_MS, TimeUnit.MILLISECONDS);
+            }
+        } catch (RejectedExecutionException ignored) {
+            // Shutdown won the race before the manual refresh could be scheduled.
         }
     }
 
-    public void stop() {
+    public synchronized void stop() {
         running = false;
-        if (socket != null && !socket.isClosed()) {
-            socket.close();
-        }
+        closeSocket();
         listenerExecutor.shutdownNow();
         scheduler.shutdownNow();
         devices.clear();
@@ -138,6 +171,26 @@ public class DiscoveryService {
             "UDP discovery stopped."
         );
         logger.info("UDP discovery stopped");
+    }
+
+    public void updateTransferPort(int tcpPort) {
+        if (tcpPort < 1 || tcpPort > 65_535) {
+            throw new IllegalArgumentException("Invalid TCP transfer port: " + tcpPort);
+        }
+        if (this.tcpPort != tcpPort) {
+            this.tcpPort = tcpPort;
+            refreshNow();
+        }
+    }
+
+    public void retryRecovery() {
+        if (running && !isSocketOpen()) {
+            requestSocketRecovery("Discovery socket is unavailable.");
+        }
+    }
+
+    public boolean isRunning() {
+        return running;
     }
 
     public SendTargetResolution resolveSendTarget(String remoteDeviceId) {
@@ -179,23 +232,23 @@ public class DiscoveryService {
     }
 
     private void listenLoop() {
+        DatagramSocket listeningSocket = socket;
+        if (listeningSocket == null) {
+            return;
+        }
         byte[] buffer = new byte[ProtocolConstants.DISCOVERY_PACKET_MAX_BYTES];
         while (running) {
             try {
                 DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
-                socket.receive(packet);
+                listeningSocket.receive(packet);
                 handlePacket(packet);
             } catch (SocketTimeoutException ignored) {
                 // Polling timeout is expected.
             } catch (SocketException exception) {
                 if (running) {
-                    diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
-                    diagnosticsService.recordDiscoveryError(
-                        ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR,
-                        exception.getMessage()
-                    );
-                    logger.warning("Discovery socket error: " + exception.getMessage());
+                    requestSocketRecovery("Discovery socket error: " + exception.getMessage());
                 }
+                return;
             } catch (IOException exception) {
                 if (running) {
                     diagnosticsService.recordDiscoveryError(
@@ -260,6 +313,7 @@ public class DiscoveryService {
         }
 
         long now = System.currentTimeMillis();
+        DeviceInfo previous = devices.get(message.getDeviceId());
         DeviceInfo device = new DeviceInfo(
             message.getDeviceId(),
             message.getDeviceName(),
@@ -268,10 +322,14 @@ public class DiscoveryService {
             packet.getAddress().getHostAddress(),
             message.getTcpPort(),
             message.getCapabilities(),
-            now
+            now,
+            EndpointCandidates.withLatest(
+                previous == null ? List.of() : previous.getEndpointCandidates(),
+                new DeviceInfo.TransferEndpoint(packet.getAddress().getHostAddress(), message.getTcpPort())
+            )
         );
 
-        DeviceInfo previous = devices.put(device.getDeviceId(), device);
+        previous = devices.put(device.getDeviceId(), device);
         boolean added = previous == null;
         boolean changed = added || hasPresentationChanged(previous, device);
         diagnosticsService.recordDiscoveryReceived(device, packet.getAddress().getHostAddress());
@@ -350,11 +408,7 @@ public class DiscoveryService {
             broadcastOnce();
         } catch (IOException exception) {
             if (running) {
-                diagnosticsService.recordDiscoveryError(
-                    ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR,
-                    exception.getMessage()
-                );
-                logger.warning("Failed to broadcast discovery: " + exception.getMessage());
+                requestSocketRecovery("Failed to broadcast discovery: " + exception.getMessage());
             }
         }
     }
@@ -404,8 +458,12 @@ public class DiscoveryService {
     }
 
     private void sendPacket(byte[] payload, InetAddress address) throws IOException {
-        DatagramPacket packet = new DatagramPacket(payload, payload.length, address, ProtocolConstants.DISCOVERY_PORT);
-        socket.send(packet);
+        DatagramSocket activeSocket = socket;
+        if (activeSocket == null || activeSocket.isClosed()) {
+            throw new SocketException("Discovery socket is not available.");
+        }
+        DatagramPacket packet = new DatagramPacket(payload, payload.length, address, discoveryPort);
+        activeSocket.send(packet);
     }
 
     private List<InetAddress> resolveBroadcastAddresses() throws SocketException {
@@ -485,5 +543,95 @@ public class DiscoveryService {
 
     private boolean isBlank(String value) {
         return value == null || value.isBlank();
+    }
+
+    boolean isSocketOpen() {
+        DatagramSocket activeSocket = socket;
+        return activeSocket != null && !activeSocket.isClosed();
+    }
+
+    void closeSocketForTest() {
+        closeSocket();
+    }
+
+    private DatagramSocket openSocket() throws SocketException {
+        DatagramSocket openedSocket = new DatagramSocket(null);
+        try {
+            openedSocket.setReuseAddress(true);
+            openedSocket.bind(new InetSocketAddress(discoveryPort));
+            openedSocket.setBroadcast(true);
+            openedSocket.setSoTimeout(1000);
+            return openedSocket;
+        } catch (SocketException exception) {
+            openedSocket.close();
+            throw exception;
+        }
+    }
+
+    private void requestSocketRecovery(String details) {
+        if (!running || !socketRecoveryScheduled.compareAndSet(false, true)) {
+            return;
+        }
+        diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
+        diagnosticsService.recordDiscoveryError(ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR, details);
+        logger.warning(details + "; scheduling UDP discovery recovery.");
+        scheduleSocketRecovery(0);
+    }
+
+    private void scheduleSocketRecovery(int attempt) {
+        long delay = Math.min(
+            INITIAL_SOCKET_RECOVERY_DELAY_MILLIS * (1L << Math.min(attempt, 4)),
+            MAX_SOCKET_RECOVERY_DELAY_MILLIS
+        );
+        try {
+            scheduler.schedule(() -> recoverSocket(attempt), delay, TimeUnit.MILLISECONDS);
+        } catch (RejectedExecutionException ignored) {
+            socketRecoveryScheduled.set(false);
+        }
+    }
+
+    private void recoverSocket(int attempt) {
+        if (!running) {
+            socketRecoveryScheduled.set(false);
+            return;
+        }
+
+        closeSocket();
+        try {
+            DatagramSocket recoveredSocket = openSocket();
+            if (!running) {
+                recoveredSocket.close();
+                socketRecoveryScheduled.set(false);
+                return;
+            }
+            socket = recoveredSocket;
+            diagnosticsService.refreshNetworkSnapshot();
+            diagnosticsService.setDiscoveryStatus("RUNNING", null);
+            socketRecoveryScheduled.set(false);
+            listenerExecutor.submit(this::listenLoop);
+            safeBroadcast();
+            logger.info("UDP discovery socket recovered on port " + discoveryPort);
+        } catch (IOException exception) {
+            if (attempt + 1 >= MAX_SOCKET_RECOVERY_ATTEMPTS) {
+                socketRecoveryScheduled.set(false);
+                diagnosticsService.setDiscoveryStatus("ERROR", ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR);
+                diagnosticsService.recordDiscoveryError(
+                    ProtocolConstants.DIAGNOSTIC_DISCOVERY_SOCKET_ERROR,
+                    "UDP discovery recovery exhausted: " + exception.getMessage()
+                );
+                logger.warning("UDP discovery recovery exhausted: " + exception.getMessage());
+                return;
+            }
+            logger.warning("UDP discovery recovery attempt " + (attempt + 1) + " failed: " + exception.getMessage());
+            scheduleSocketRecovery(attempt + 1);
+        }
+    }
+
+    private void closeSocket() {
+        DatagramSocket activeSocket = socket;
+        socket = null;
+        if (activeSocket != null && !activeSocket.isClosed()) {
+            activeSocket.close();
+        }
     }
 }

@@ -40,6 +40,18 @@
     -fx-border-color: #bde2c3;
 }
 
+.receive-card-starting {
+    -fx-border-color: #dbe6f4;
+}
+
+.receive-card-busy {
+    -fx-border-color: #f3cf9a;
+}
+
+.receive-card-unavailable {
+    -fx-border-color: #f3c8c5;
+}
+
 .section-title {
     -fx-font-size: 20px;
     -fx-font-weight: 700;
@@ -68,6 +80,18 @@
     -fx-font-weight: 600;
 }
 
+.receive-status-starting {
+    -fx-text-fill: #55728f;
+}
+
+.receive-status-busy {
+    -fx-text-fill: #bd6b00;
+}
+
+.receive-status-unavailable {
+    -fx-text-fill: #cc4033;
+}
+
 .ready-chip,
 .subtle-chip,
 .status-pill {
@@ -80,6 +104,21 @@
 .ready-chip {
     -fx-background-color: #e7f8ec;
     -fx-text-fill: #1b8a43;
+}
+
+.receive-chip-starting {
+    -fx-background-color: #eef4fb;
+    -fx-text-fill: #55728f;
+}
+
+.receive-chip-busy {
+    -fx-background-color: #fff0df;
+    -fx-text-fill: #bd6b00;
+}
+
+.receive-chip-unavailable {
+    -fx-background-color: #fde9e7;
+    -fx-text-fill: #cc4033;
 }
 
 .subtle-chip {
@@ -139,6 +178,26 @@
     -fx-border-style: segments(10, 8);
     -fx-border-radius: 18px;
     -fx-background-radius: 18px;
+}
+
+.drop-area-compact {
+    -fx-padding: 14px 20px;
+    -fx-spacing: 4px;
+}
+
+.drop-area-compact .drop-badge {
+    -fx-min-width: 38px;
+    -fx-min-height: 38px;
+    -fx-max-width: 38px;
+    -fx-max-height: 38px;
+}
+
+.drop-area-compact .drop-badge .label {
+    -fx-font-size: 20px;
+}
+
+.drop-area-compact .drop-title {
+    -fx-font-size: 17px;
 }
 
 .drop-badge {
@@ -230,6 +289,11 @@
 .status-waiting {
     -fx-background-color: #fff0df;
     -fx-text-fill: #d07a00;
+}
+
+.status-delivery-unknown {
+    -fx-background-color: #f0eaff;
+    -fx-text-fill: #7350a6;
 }
 
 .progress-bar {

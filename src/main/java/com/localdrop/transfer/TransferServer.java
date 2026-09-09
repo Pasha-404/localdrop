@@ -17,13 +17,21 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalTime;
+import java.util.HashSet;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Supplier;
 import java.util.logging.Logger;
@@ -49,10 +57,12 @@ public class TransferServer {
     private final ExecutorService acceptExecutor = Executors.newSingleThreadExecutor(r -> new Thread(r, "localdrop-transfer-accept"));
     private final ExecutorService clientExecutor = Executors.newFixedThreadPool(4, r -> new Thread(r, "localdrop-transfer-client"));
     private final AtomicBoolean activeIncomingTransfer = new AtomicBoolean(false);
+    private final Set<Socket> activeSockets = ConcurrentHashMap.newKeySet();
+    private final Semaphore handshakeSlots = new Semaphore(ProtocolConstants.MAX_HANDSHAKING_CONNECTIONS);
 
     private volatile boolean running;
     private volatile int boundPort;
-    private ServerSocket serverSocket;
+    private volatile ServerSocket serverSocket;
 
     public TransferServer(
         Supplier<Path> receiveFolderSupplier,
@@ -138,15 +148,21 @@ public class TransferServer {
 
     public void stop() {
         running = false;
+        ServerSocket listeningSocket = serverSocket;
         try {
-            if (serverSocket != null && !serverSocket.isClosed()) {
-                serverSocket.close();
+            if (listeningSocket != null && !listeningSocket.isClosed()) {
+                listeningSocket.close();
             }
         } catch (IOException ignored) {
             // Ignore shutdown errors.
         }
+        for (Socket socket : activeSockets) {
+            closeQuietly(socket);
+        }
         acceptExecutor.shutdownNow();
         clientExecutor.shutdownNow();
+        awaitTermination(acceptExecutor, "accept");
+        awaitTermination(clientExecutor, "client");
         diagnosticsService.setTransferServerStatus("STOPPED", null);
         diagnosticsService.recordTransferEvent(
             DiagnosticEventType.TRANSFER_SERVER_STOPPED,
@@ -166,7 +182,31 @@ public class TransferServer {
         while (running) {
             try {
                 Socket socket = serverSocket.accept();
-                clientExecutor.submit(() -> handleClient(socket));
+                if (!running) {
+                    closeQuietly(socket);
+                    continue;
+                }
+                if (!handshakeSlots.tryAcquire()) {
+                    closeQuietly(socket);
+                    logger.fine("Rejected excess incoming transfer handshake connection");
+                    continue;
+                }
+                activeSockets.add(socket);
+                try {
+                    clientExecutor.submit(() -> {
+                        try {
+                            handleClient(socket);
+                        } finally {
+                            activeSockets.remove(socket);
+                            handshakeSlots.release();
+                            closeQuietly(socket);
+                        }
+                    });
+                } catch (RejectedExecutionException exception) {
+                    activeSockets.remove(socket);
+                    handshakeSlots.release();
+                    closeQuietly(socket);
+                }
             } catch (IOException exception) {
                 if (running) {
                     diagnosticsService.setTransferServerStatus("ERROR", ProtocolConstants.ERROR_CONNECTION_LOST);
@@ -187,13 +227,20 @@ public class TransferServer {
         }
     }
 
+    int activeConnectionCount() {
+        return activeSockets.size();
+    }
+
     private void handleClient(Socket socket) {
         String remoteAddress = socket.getInetAddress().getHostAddress();
         try (socket;
              DataInputStream input = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
-             DataOutputStream output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()))) {
+            DataOutputStream output = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()))) {
             socket.setSoTimeout(ProtocolConstants.HEADER_READ_TIMEOUT_MS);
             ProtocolMessage sessionStart = ProtocolMessage.read(input);
+            if (!hasCommonEnvelope(sessionStart)) {
+                return;
+            }
             if (!Integer.valueOf(ProtocolConstants.PROTOCOL_VERSION).equals(sessionStart.getProtocolVersion())) {
                 writeSessionRejection(output, sessionStart.getSessionId(), ProtocolConstants.ERROR_PROTOCOL_VERSION_MISMATCH, "Protocol version mismatch.");
                 return;
@@ -202,16 +249,21 @@ public class TransferServer {
                 writeSessionRejection(output, sessionStart.getSessionId(), ProtocolConstants.ERROR_MALFORMED_MESSAGE, "Expected SESSION_START.");
                 return;
             }
+            TransferSession session;
+            try {
+                session = validateSessionStart(sessionStart);
+            } catch (TransferException exception) {
+                writeSessionRejection(output, sessionStart.getSessionId(), exception.getErrorCode(), exception.getMessage());
+                return;
+            }
             if (!activeIncomingTransfer.compareAndSet(false, true)) {
                 writeSessionRejection(output, sessionStart.getSessionId(), ProtocolConstants.ERROR_SESSION_BUSY, "Receiver is busy.");
                 return;
             }
 
             try {
-                TransferSession session;
                 Path receiveFolder;
                 try {
-                    session = validateSessionStart(sessionStart);
                     receiveFolder = prepareReceiveFolder();
                     ensureUsableSpace(receiveFolder, session.totalSize());
                 } catch (TransferException exception) {
@@ -313,6 +365,9 @@ public class TransferServer {
     }
 
     private TransferSession validateSessionStart(ProtocolMessage sessionStart) throws TransferException {
+        if (!ProtocolConstants.TYPE_SESSION_START.equals(sessionStart.getType()) || !hasCommonEnvelope(sessionStart)) {
+            throw new TransferException(ProtocolConstants.ERROR_MALFORMED_MESSAGE, "SESSION_START is missing required common fields.");
+        }
         if (isBlank(sessionStart.getSessionId())) {
             throw new TransferException(ProtocolConstants.ERROR_INVALID_SESSION, "Session id is missing.");
         }
@@ -356,7 +411,11 @@ public class TransferServer {
         if (!Files.isWritable(receiveFolder)) {
             throw new TransferException(ProtocolConstants.ERROR_RECEIVE_FOLDER_NOT_WRITABLE, "Receive folder is not writable.");
         }
-        return receiveFolder.toAbsolutePath().normalize();
+        try {
+            return ReceiveStagingTransaction.prepareReceiveRoot(receiveFolder);
+        } catch (IOException exception) {
+            throw new TransferException(ProtocolConstants.ERROR_RECEIVE_FOLDER_NOT_WRITABLE, "Receive folder cannot be prepared safely.");
+        }
     }
 
     private void ensureUsableSpace(Path receiveFolder, long expectedBytes) throws TransferException {
@@ -383,12 +442,16 @@ public class TransferServer {
     ) throws IOException {
         int receivedFiles = 0;
         long receivedBytes = 0;
+        Set<String> receivedFileIds = new HashSet<>();
 
         while (running) {
             socket.setSoTimeout(ProtocolConstants.HEADER_READ_TIMEOUT_MS);
             ProtocolMessage message = ProtocolMessage.read(input);
+            if (!hasCommonEnvelope(message)) {
+                throw new TransferException(ProtocolConstants.ERROR_MALFORMED_MESSAGE, "TCP message is missing required common fields.");
+            }
             if (ProtocolConstants.TYPE_SESSION_FINISH.equals(message.getType())) {
-                validateFinishMessage(session, message, receivedFiles, receivedBytes);
+                validateFinishMessage(session, message, receivedFiles, receivedBytes, receivedFileIds);
                 ProtocolMessage.write(output, ProtocolMessage.sessionFinishAck(
                     session.sessionId(),
                     localDeviceId,
@@ -402,11 +465,12 @@ public class TransferServer {
                 throw new TransferException(ProtocolConstants.ERROR_MALFORMED_MESSAGE, "Unexpected protocol message " + message.getType());
             }
 
-            validateFileMeta(session, message, receivedFiles, receivedBytes);
+            validateFileMeta(session, message, receivedFiles, receivedBytes, receivedFileIds);
             socket.setSoTimeout(ProtocolConstants.FILE_TRANSFER_IDLE_TIMEOUT_MS);
             receiveSingleFile(session, message, input, output, receiveFolder, remoteAddress);
             receivedFiles++;
             receivedBytes += message.getSize();
+            receivedFileIds.add(message.getFileId());
         }
     }
 
@@ -414,13 +478,26 @@ public class TransferServer {
         TransferSession session,
         ProtocolMessage message,
         int receivedFiles,
-        long receivedBytes
+        long receivedBytes,
+        Set<String> receivedFileIds
     ) throws TransferException {
+        if (!hasCommonEnvelope(message)) {
+            throw new TransferException(ProtocolConstants.ERROR_MALFORMED_MESSAGE, "SESSION_FINISH is missing required common fields.");
+        }
+        if (!Integer.valueOf(ProtocolConstants.PROTOCOL_VERSION).equals(message.getProtocolVersion())) {
+            throw new TransferException(ProtocolConstants.ERROR_PROTOCOL_VERSION_MISMATCH, "SESSION_FINISH uses an incompatible protocol version.");
+        }
         if (!session.sessionId().equals(message.getSessionId())
             || !session.senderDeviceId().equals(message.getDeviceId())) {
             throw new TransferException(ProtocolConstants.ERROR_INVALID_SESSION, "SESSION_FINISH has invalid identifiers.");
         }
-        if (receivedFiles != session.totalFiles() || receivedBytes != session.totalSize()) {
+        if (SessionTerminalInvariants.terminalSessionError(
+            receivedFiles,
+            receivedFileIds,
+            receivedBytes,
+            session.totalFiles(),
+            session.totalSize()
+        ) != null) {
             throw new TransferException(ProtocolConstants.ERROR_INVALID_SESSION, "SESSION_FINISH arrived before all declared files were received.");
         }
     }
@@ -429,13 +506,23 @@ public class TransferServer {
         TransferSession session,
         ProtocolMessage fileMeta,
         int receivedFiles,
-        long receivedBytes
+        long receivedBytes,
+        Set<String> receivedFileIds
     ) throws TransferException {
+        if (!hasCommonEnvelope(fileMeta)) {
+            throw new TransferException(ProtocolConstants.ERROR_MALFORMED_MESSAGE, "FILE_META is missing required common fields.");
+        }
+        if (!Integer.valueOf(ProtocolConstants.PROTOCOL_VERSION).equals(fileMeta.getProtocolVersion())) {
+            throw new TransferException(ProtocolConstants.ERROR_PROTOCOL_VERSION_MISMATCH, "FILE_META uses an incompatible protocol version.");
+        }
         if (!session.sessionId().equals(fileMeta.getSessionId())) {
             throw new TransferException(ProtocolConstants.ERROR_INVALID_SESSION, "FILE_META session id does not match the active session.");
         }
         if (isBlank(fileMeta.getFileId())) {
             throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_ID, "FILE_META file id is missing.");
+        }
+        if (receivedFileIds.contains(fileMeta.getFileId())) {
+            throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_ID, "FILE_META file id was already received.");
         }
         if (!session.senderDeviceId().equals(fileMeta.getDeviceId())) {
             throw new TransferException(ProtocolConstants.ERROR_INVALID_SESSION, "FILE_META came from a different device.");
@@ -478,20 +565,13 @@ public class TransferServer {
 
         Path relativePath;
         Path finalPath;
+        ReceiveStagingTransaction stagingTransaction;
         try {
             relativePath = FileUtils.sanitizeReceivedRelativePath(fileMeta.getRelativePath(), fileMeta.getFileName());
-            Path targetPath = receiveFolder.resolve(relativePath).normalize();
-            if (!targetPath.startsWith(receiveFolder)) {
-                throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Resolved target path leaves the receive folder.");
-            }
-
-            Path targetParent = targetPath.getParent() == null ? receiveFolder : targetPath.getParent();
-            Files.createDirectories(targetParent);
+            Path targetPath = ReceiveStagingTransaction.prepareTargetPath(receiveFolder, relativePath);
             ensureUsableSpace(receiveFolder, fileMeta.getSize());
-            finalPath = FileNameResolver.resolve(targetPath).normalize();
-            if (!finalPath.startsWith(receiveFolder)) {
-                throw new TransferException(ProtocolConstants.ERROR_INVALID_FILE_PATH, "Final target path leaves the receive folder.");
-            }
+            finalPath = targetPath;
+            stagingTransaction = ReceiveStagingTransaction.create(receiveFolder);
         } catch (TransferException exception) {
             rejectFileAfterDraining(input, output, session, fileMeta, exception);
             throw exception;
@@ -504,10 +584,9 @@ public class TransferServer {
             throw failure;
         }
 
-        Path tempPath = finalPath.resolveSibling(finalPath.getFileName() + ".localdrop-part");
         TransferException writeFailure = null;
         long remaining = fileMeta.getSize();
-        try (var fileOutputStream = new BufferedOutputStream(Files.newOutputStream(tempPath))) {
+        try (FileChannel stagingChannel = stagingTransaction.openWriteChannel()) {
             byte[] buffer = new byte[64 * 1024];
             while (remaining > 0) {
                 int chunkSize = (int) Math.min(buffer.length, remaining);
@@ -515,51 +594,51 @@ public class TransferServer {
                 try {
                     read = input.read(buffer, 0, chunkSize);
                 } catch (SocketTimeoutException exception) {
-                    Files.deleteIfExists(tempPath);
+                    stagingTransaction.cleanupQuietly();
                     writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_TRANSFER_TIMEOUT, "File transfer timed out.");
                     throw new TransferException(ProtocolConstants.ERROR_TRANSFER_TIMEOUT, "File transfer timed out.");
                 }
                 if (read < 0) {
-                    Files.deleteIfExists(tempPath);
+                    stagingTransaction.cleanupQuietly();
                     throw new TransferException(ProtocolConstants.ERROR_CONNECTION_LOST, "Stream ended during file payload.");
                 }
                 if (writeFailure == null) {
                     try {
-                        fileOutputStream.write(buffer, 0, read);
+                        writeFully(stagingChannel, buffer, read);
                     } catch (IOException exception) {
                         writeFailure = new TransferException(ProtocolConstants.ERROR_FILE_WRITE_ERROR, "Cannot write the received file.");
                     }
                 }
                 remaining -= read;
             }
+            if (writeFailure == null) {
+                stagingChannel.force(true);
+            }
         } catch (TransferException exception) {
-            Files.deleteIfExists(tempPath);
+            stagingTransaction.cleanupQuietly();
             throw exception;
         } catch (IOException exception) {
-            Files.deleteIfExists(tempPath);
+            stagingTransaction.cleanupQuietly();
             writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, ProtocolConstants.ERROR_FILE_WRITE_ERROR, "Cannot write the received file.");
             throw new TransferException(ProtocolConstants.ERROR_FILE_WRITE_ERROR, exception.getMessage());
         }
 
         if (writeFailure != null) {
-            Files.deleteIfExists(tempPath);
+            stagingTransaction.cleanupQuietly();
             writeFileAck(output, session.sessionId(), fileMeta.getFileId(), false, writeFailure.getErrorCode(), writeFailure.getMessage());
             throw writeFailure;
         }
 
         long savedSize;
         try {
-            FileUtils.moveAtomicallyOrReplace(tempPath, finalPath);
+            stagingTransaction.verifySize(fileMeta.getSize());
+            finalPath = stagingTransaction.publish(finalPath);
             if (fileMeta.getLastModified() != null) {
                 FileUtils.applyLastModified(finalPath, fileMeta.getLastModified());
             }
             savedSize = Files.size(finalPath);
         } catch (IOException exception) {
-            try {
-                Files.deleteIfExists(tempPath);
-            } catch (IOException ignored) {
-                // The structured ACK below remains more useful than a best-effort cleanup failure.
-            }
+            stagingTransaction.cleanupQuietly();
             TransferException failure = new TransferException(
                 ProtocolConstants.ERROR_FILE_WRITE_ERROR,
                 "Cannot finalize the received file."
@@ -580,8 +659,16 @@ public class TransferServer {
             null,
             fileMeta.getRelativePath()
         );
-        logger.info("Received file " + relativePath + " from " + session.senderDeviceName());
-        listener.onReceiveCompleted(new RecentlyReceivedItem(relativePath.toString(), savedSize, LocalTime.now()));
+        Path savedRelativePath = receiveFolder.toAbsolutePath().normalize().relativize(finalPath.toAbsolutePath().normalize());
+        logger.info("Received file " + savedRelativePath + " from " + session.senderDeviceName());
+        listener.onReceiveCompleted(new RecentlyReceivedItem(savedRelativePath.toString(), savedSize, LocalTime.now()));
+    }
+
+    private void writeFully(FileChannel channel, byte[] source, int length) throws IOException {
+        ByteBuffer buffer = ByteBuffer.wrap(source, 0, length);
+        while (buffer.hasRemaining()) {
+            channel.write(buffer);
+        }
     }
 
     private void rejectFileAfterDraining(
@@ -634,18 +721,53 @@ public class TransferServer {
         String errorCode,
         String errorMessage
     ) throws IOException {
-        ProtocolMessage.write(output, ProtocolMessage.sessionRejected(sessionId, errorMessage, errorCode));
+        ProtocolMessage.write(output, ProtocolMessage.sessionRejected(
+            sessionId,
+            localDeviceId,
+            localDeviceName,
+            localDeviceType,
+            errorMessage,
+            errorCode
+        ));
     }
 
     private void cleanupPartialFiles() {
         try {
-            FileUtils.cleanupPartialFiles(receiveFolderSupplier.get(), ProtocolConstants.PART_FILE_CLEANUP_TTL_MS);
+            ReceiveStagingTransaction.cleanupAbandoned(
+                receiveFolderSupplier.get(),
+                ProtocolConstants.PART_FILE_CLEANUP_TTL_MS
+            );
         } catch (RuntimeException ignored) {
-            // Cleanup is best-effort only.
+            // Startup cleanup must never prevent the receiver from binding.
+        }
+    }
+
+    private void awaitTermination(ExecutorService executor, String name) {
+        try {
+            if (!executor.awaitTermination(2, TimeUnit.SECONDS)) {
+                logger.warning("Timed out waiting for TCP " + name + " executor shutdown.");
+            }
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void closeQuietly(Socket socket) {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // Socket closure is best effort during shutdown and rejected admission.
         }
     }
 
     private boolean isBlank(String value) {
         return value == null || value.isBlank();
+    }
+
+    private boolean hasCommonEnvelope(ProtocolMessage message) {
+        return !isBlank(message.getMessageId())
+            && message.getTimestamp() != null
+            && !isBlank(message.getDeviceId())
+            && message.getDeviceId().length() <= ProtocolConstants.MAX_DEVICE_ID_LENGTH;
     }
 }

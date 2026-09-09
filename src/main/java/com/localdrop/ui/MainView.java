@@ -20,6 +20,7 @@ import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
 import javafx.scene.control.ProgressBar;
 import javafx.scene.control.ScrollPane;
+import javafx.scene.control.Tooltip;
 import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
 import javafx.scene.layout.BorderPane;
@@ -38,12 +39,16 @@ import java.util.function.Consumer;
 
 public class MainView {
     private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm");
+    private static final double COMPACT_LAYOUT_THRESHOLD = 1200;
 
     private final BorderPane root = new BorderPane();
     private final ListView<DeviceInfo> deviceListView = new ListView<>();
     private final ListView<TransferQueueItem> queueListView = new ListView<>();
     private final ListView<RecentlyReceivedItem> recentListView = new ListView<>();
     private final VBox dropArea = new VBox(8);
+    private final HBox wideContent = new HBox(18);
+    private final VBox compactContent = new VBox(16);
+    private final ScrollPane contentScroll = new ScrollPane();
     private final Button refreshButton = new Button();
     private final Button diagnosticsButton = new Button();
     private final Button addFilesButton = new Button();
@@ -76,6 +81,10 @@ public class MainView {
     private final Label recentTitleLabel = new Label();
     private final Label recentEmptyLabel = new Label();
     private final Label inlineErrorLabel = new Label();
+    private final VBox receiveCard = card();
+    private final Circle receiveStatusCircle = new Circle(24, Color.web("#17a34a").deriveColor(0, 1, 1, 0.15));
+    private final Label receiveStatusIconLabel = new Label("ME");
+    private final StackPane receiveStatusIcon = new StackPane(receiveStatusCircle, receiveStatusIconLabel);
     private final Label networkCaptionLabel = new Label();
     private final Label networkLabel = new Label("Local network");
     private final Label discoveryCaptionLabel = new Label();
@@ -85,6 +94,10 @@ public class MainView {
 
     private I18n i18n;
     private int currentQueueCount;
+    private VBox devicesColumn;
+    private VBox sendingColumn;
+    private VBox receivingColumn;
+    private boolean compactLayout;
 
     public MainView(
         ObservableList<DeviceInfo> devices,
@@ -178,6 +191,7 @@ public class MainView {
 
     public void updateQueueCount(int count) {
         currentQueueCount = count;
+        updateDropAreaDensity();
         if (i18n != null) {
             queueTitleLabel.setText(i18n.format("sending.queueTitle", count));
         }
@@ -185,6 +199,7 @@ public class MainView {
 
     public void updateReceiveFolder(Path receiveFolder) {
         receiveFolderLabel.setText(receiveFolder.toString());
+        receiveFolderLabel.setTooltip(new Tooltip(receiveFolder.toString()));
     }
 
     public void updateCurrentDeviceName(String deviceName) {
@@ -193,6 +208,23 @@ public class MainView {
 
     public void updateReceivingActivity(String message) {
         receivingActivityLabel.setText(message);
+    }
+
+    public void updateReceiveAvailability(String message, String chipText, String state) {
+        readyMessageLabel.setText(message);
+        onlineChipLabel.setText(chipText);
+
+        receiveCard.getStyleClass().removeAll("receive-card-ready", "receive-card-busy", "receive-card-unavailable", "receive-card-starting");
+        readyMessageLabel.getStyleClass().removeAll("receive-status-ready", "receive-status-busy", "receive-status-unavailable", "receive-status-starting");
+        onlineChipLabel.getStyleClass().removeAll("receive-chip-ready", "receive-chip-busy", "receive-chip-unavailable", "receive-chip-starting");
+        receiveCard.getStyleClass().add("receive-card-" + state);
+        readyMessageLabel.getStyleClass().add("receive-status-" + state);
+        onlineChipLabel.getStyleClass().add("receive-chip-" + state);
+        updateReceiveStatusIcon(state);
+    }
+
+    public void updateDiscoveryStatus(String status) {
+        discoveryLabel.setText(status);
     }
 
     public void updateSendButton(String text, boolean disabled) {
@@ -293,26 +325,28 @@ public class MainView {
     }
 
     private Parent buildContent() {
-        HBox content = new HBox(18);
-        content.setPadding(new Insets(0, 22, 18, 22));
+        devicesColumn = buildDevicesColumn();
+        sendingColumn = buildSendingColumn();
+        receivingColumn = buildReceivingColumn();
 
-        VBox leftColumn = buildDevicesColumn();
-        VBox centerColumn = buildSendingColumn();
-        VBox rightColumn = buildReceivingColumn();
+        devicesColumn.setPrefWidth(300);
+        receivingColumn.setPrefWidth(320);
+        devicesColumn.setMaxWidth(Double.MAX_VALUE);
+        sendingColumn.setMaxWidth(Double.MAX_VALUE);
+        receivingColumn.setMaxWidth(Double.MAX_VALUE);
+        HBox.setHgrow(sendingColumn, Priority.ALWAYS);
 
-        leftColumn.setPrefWidth(300);
-        rightColumn.setPrefWidth(320);
-        HBox.setHgrow(centerColumn, Priority.ALWAYS);
-        centerColumn.setMaxWidth(Double.MAX_VALUE);
+        wideContent.setPadding(new Insets(0, 22, 18, 22));
+        compactContent.setPadding(new Insets(0, 22, 18, 22));
+        wideContent.getChildren().addAll(devicesColumn, sendingColumn, receivingColumn);
 
-        content.getChildren().addAll(leftColumn, centerColumn, rightColumn);
-
-        ScrollPane contentScroll = new ScrollPane(content);
         contentScroll.getStyleClass().add("content-scroll");
         contentScroll.setFitToWidth(true);
         contentScroll.setFitToHeight(true);
         contentScroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.AS_NEEDED);
         contentScroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.AS_NEEDED);
+        contentScroll.setContent(wideContent);
+        root.widthProperty().addListener((observable, oldWidth, newWidth) -> updateContentLayout(newWidth.doubleValue()));
         return contentScroll;
     }
 
@@ -366,13 +400,13 @@ public class MainView {
     private VBox buildReceivingColumn() {
         VBox column = new VBox(16);
 
-        VBox receiveCard = card();
         receiveCard.getStyleClass().add("receive-card");
         receiveCard.getChildren().add(titleRow(receivingTitleLabel));
 
         HBox readyHeader = new HBox(12);
         readyHeader.setAlignment(Pos.TOP_LEFT);
-        StackPane readyIcon = statusIcon("ME", Color.web("#17a34a"));
+        receiveStatusCircle.setStrokeWidth(1.2);
+        receiveStatusIconLabel.getStyleClass().add("icon-text");
 
         VBox readyText = new VBox(4);
         thisComputerLabel.getStyleClass().add("muted-label");
@@ -381,7 +415,7 @@ public class MainView {
         onlineChipLabel.getStyleClass().add("ready-chip");
         readyText.getChildren().addAll(thisComputerLabel, currentDeviceNameLabel, readyMessageLabel, onlineChipLabel);
 
-        readyHeader.getChildren().addAll(readyIcon, readyText);
+        readyHeader.getChildren().addAll(receiveStatusIcon, readyText);
 
         saveFolderTitleLabel.getStyleClass().add("muted-label");
         receiveFolderLabel.setWrapText(true);
@@ -444,6 +478,36 @@ public class MainView {
         dropSubtitleLabel.getStyleClass().add("helper-text");
 
         dropArea.getChildren().addAll(dropBadge, dropTitleLabel, dropSubtitleLabel);
+        updateDropAreaDensity();
+    }
+
+    private void updateContentLayout(double availableWidth) {
+        boolean shouldUseCompactLayout = availableWidth > 0 && availableWidth < COMPACT_LAYOUT_THRESHOLD;
+        if (shouldUseCompactLayout == compactLayout) {
+            return;
+        }
+        compactLayout = shouldUseCompactLayout;
+        if (compactLayout) {
+            wideContent.getChildren().clear();
+            compactContent.getChildren().setAll(devicesColumn, sendingColumn, receivingColumn);
+            contentScroll.setFitToHeight(false);
+            contentScroll.setContent(compactContent);
+        } else {
+            compactContent.getChildren().clear();
+            wideContent.getChildren().setAll(devicesColumn, sendingColumn, receivingColumn);
+            contentScroll.setFitToHeight(true);
+            contentScroll.setContent(wideContent);
+        }
+    }
+
+    private void updateDropAreaDensity() {
+        boolean hasQueuedFiles = currentQueueCount > 0;
+        dropArea.getStyleClass().remove("drop-area-compact");
+        if (hasQueuedFiles) {
+            dropArea.getStyleClass().add("drop-area-compact");
+        }
+        dropArea.setMinHeight(hasQueuedFiles ? 124 : 220);
+        dropArea.setPrefHeight(hasQueuedFiles ? 124 : Region.USE_COMPUTED_SIZE);
     }
 
     private HBox titleRow(Label titleLabel) {
@@ -469,6 +533,17 @@ public class MainView {
         Label label = new Label(text);
         label.getStyleClass().add("icon-text");
         return new StackPane(circle, label);
+    }
+
+    private void updateReceiveStatusIcon(String state) {
+        Color color = switch (state) {
+            case "busy" -> Color.web("#bd6b00");
+            case "unavailable" -> Color.web("#cc4033");
+            case "starting" -> Color.web("#55728f");
+            default -> Color.web("#17a34a");
+        };
+        receiveStatusCircle.setFill(color.deriveColor(0, 1, 1, 0.15));
+        receiveStatusCircle.setStroke(color.deriveColor(0, 1, 1, 0.45));
     }
 
     private final class DeviceCell extends ListCell<DeviceInfo> {
@@ -554,7 +629,12 @@ public class MainView {
             infoBox.getChildren().addAll(nameLabel, sizeLabel);
 
             TransferStatus status = item.getStatus();
-            if (item.getMessage() != null && !item.getMessage().isBlank() && status != TransferStatus.SENDING) {
+            if (status == TransferStatus.DELIVERY_UNKNOWN) {
+                Label messageLabel = new Label(i18n.text("queue.deliveryUnknownDetail"));
+                messageLabel.getStyleClass().add("helper-text");
+                messageLabel.setWrapText(true);
+                infoBox.getChildren().add(messageLabel);
+            } else if (item.getMessage() != null && !item.getMessage().isBlank() && status != TransferStatus.SENDING) {
                 Label messageLabel = new Label(item.getMessage());
                 messageLabel.getStyleClass().add("helper-text");
                 messageLabel.setWrapText(true);

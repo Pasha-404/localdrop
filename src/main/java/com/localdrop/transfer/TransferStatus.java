@@ -5,7 +5,8 @@ public enum TransferStatus {
     SENDING("queue.status.sending", "status-sending"),
     SENT("queue.status.sent", "status-sent"),
     FAILED("queue.status.failed", "status-failed"),
-    WAITING_FOR_RETRY("queue.status.waiting", "status-waiting");
+    WAITING_FOR_RETRY("queue.status.waiting", "status-waiting"),
+    DELIVERY_UNKNOWN("queue.status.deliveryUnknown", "status-delivery-unknown");
 
     private final String translationKey;
     private final String styleClass;

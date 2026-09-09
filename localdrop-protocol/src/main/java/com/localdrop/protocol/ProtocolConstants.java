@@ -1,7 +1,7 @@
 package com.localdrop.protocol;
 
 public final class ProtocolConstants {
-    public static final String CONTRACT_REVISION = "2026-05-16-r2";
+    public static final String CONTRACT_REVISION = "2026-09-09-r3";
 
     public static final int PROTOCOL_VERSION = 2;
     public static final int DISCOVERY_PORT = 45454;
@@ -23,6 +23,8 @@ public final class ProtocolConstants {
     public static final int HEADER_READ_TIMEOUT_MS = 10_000;
     public static final int ACK_READ_TIMEOUT_MS = 10_000;
     public static final int FILE_TRANSFER_IDLE_TIMEOUT_MS = 30_000;
+    public static final int MAX_HANDSHAKING_CONNECTIONS = 4;
+    public static final int MAX_FRESH_ENDPOINTS_PER_DEVICE = 3;
     public static final int CONTROL_READ_TIMEOUT_MS = HEADER_READ_TIMEOUT_MS;
     public static final int PAYLOAD_READ_TIMEOUT_MS = FILE_TRANSFER_IDLE_TIMEOUT_MS;
     public static final long PART_FILE_CLEANUP_TTL_MS = 86_400_000L;

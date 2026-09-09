@@ -40,4 +40,16 @@ class ProtocolMessageTest {
             assertThrows(IOException.class, () -> ProtocolMessage.read(input));
         }
     }
+
+    @Test
+    void decodesSharedFileAckErrorPrecedenceVector() throws IOException {
+        try (var stream = ProtocolMessageTest.class.getResourceAsStream("/protocol-vectors/file-ack-error-precedence-v2.json")) {
+            String json = new String(stream.readAllBytes(), StandardCharsets.UTF_8);
+            ProtocolMessage message = com.localdrop.protocol.ProtocolJson.fromJson(json, ProtocolMessage.class);
+
+            assertEquals(ProtocolConstants.TYPE_FILE_ACK, message.getType());
+            assertEquals(ProtocolConstants.ERROR_FILE_WRITE_ERROR, message.getErrorCode());
+            assertEquals(Boolean.TRUE, message.getSuccess());
+        }
+    }
 }
