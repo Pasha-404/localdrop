@@ -58,9 +58,17 @@ jobs:
             throw 'Release artifact names must be unique.'
           }
 
+          $version = $env:TAG_NAME.Substring(1)
+          $releaseNotes = Join-Path 'docs/releases' "$version.md"
+
           $releaseJson = gh release view $env:TAG_NAME --json isDraft,isPrerelease,assets 2>$null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $env:TAG_NAME $assets.FullName --title $env:TAG_NAME --generate-notes
+            if (Test-Path -LiteralPath $releaseNotes -PathType Leaf) {
+              gh release create $env:TAG_NAME $assets.FullName --title $env:TAG_NAME --notes-file $releaseNotes
+            }
+            else {
+              gh release create $env:TAG_NAME $assets.FullName --title $env:TAG_NAME --generate-notes
+            }
             if ($LASTEXITCODE -ne 0) {
               throw "Could not create GitHub release $($env:TAG_NAME)."
             }

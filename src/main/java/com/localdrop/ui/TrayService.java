@@ -22,7 +22,7 @@ public class TrayService {
             return false;
         }
 
-        try (InputStream stream = TrayService.class.getResourceAsStream("/com/localdrop/icons/app.png")) {
+        try (InputStream stream = TrayService.class.getResourceAsStream("/com/localdrop/icons/app-small.png")) {
             if (stream == null) {
                 logger.warning("Tray icon resource was not found");
                 return false;

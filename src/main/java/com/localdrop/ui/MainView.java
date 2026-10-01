@@ -302,7 +302,7 @@ public class MainView {
         header.setAlignment(Pos.CENTER_LEFT);
 
         ImageView iconView = new ImageView(new Image(Objects.requireNonNull(
-            MainView.class.getResourceAsStream("/com/localdrop/icons/app.png")
+            MainView.class.getResourceAsStream("/com/localdrop/icons/app-small.png")
         )));
         iconView.setFitWidth(28);
         iconView.setFitHeight(28);
